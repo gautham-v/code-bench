@@ -22,7 +22,8 @@
       "name": "existing_tests_pass",
       "cmd": "bash heldout/run.sh existing",
       "expect_base": "pass",
-      "timeout_s": 900
+      "timeout_s": 900,
+      "gate": true
     },
     {
       "name": "plain_editing_unchanged",
@@ -34,7 +35,8 @@
       "name": "same_number_lists_left_alone",
       "cmd": "bash heldout/run.sh all_ones",
       "expect_base": "pass",
-      "timeout_s": 900
+      "timeout_s": 900,
+      "gate": true
     },
     {
       "name": "paste_joins_count",
@@ -70,13 +72,15 @@
       "name": "edit_is_one_undo_step",
       "cmd": "bash heldout/run.sh undo_step",
       "expect_base": "fail",
-      "timeout_s": 900
+      "timeout_s": 900,
+      "gate": true
     },
     {
       "name": "cursor_stays_on_its_text",
       "cmd": "bash heldout/run.sh cursor",
       "expect_base": "fail",
-      "timeout_s": 900
+      "timeout_s": 900,
+      "gate": true
     }
   ]
 }

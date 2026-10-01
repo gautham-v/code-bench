@@ -4,16 +4,15 @@
 // checks themselves are not run again (task.mjs regrade does that). Use it after regrade, or after
 // a change to the lookup guard. Timeouts stay at 0.
 //
-//   node rescore.mjs --set hard [--dry-run]
+//   node rescore.mjs [--set hard] [--dry-run]
 
 import fs from "node:fs";
 import path from "node:path";
 import { traceOf } from "./lib/stream.mjs";
-import { leaks, resultsDir, ROOT, score, scoredFields } from "./lib/workspace.mjs";
+import { leaks, loadTask, resultsDir, ROOT, score, scoredFields, SETS } from "./lib/workspace.mjs";
 
 const argv = process.argv.slice(2);
-const SET = argv[argv.indexOf("--set") + 1];
-if (!argv.includes("--set") || !SET) throw new Error("--set easy|hard is required");
+const SET = argv.includes("--set") ? argv[argv.indexOf("--set") + 1] : SETS[0];
 
 // The run's tool calls, from its raw stream. Without the stream, the lookups already recorded stand.
 function traceFor(r) {
@@ -41,13 +40,13 @@ for (const isPrivate of [false, true]) {
     const trace = traceFor(r);
     const raw = Object.fromEntries(Object.entries(r.check_outputs).map(([k, v]) => [k, v.exit === 0]));
     const fields = trace ? scoredFields(raw, trace) : r.lookups?.some((x) => x.kind === "checkout") ? r.fields : raw;
-    let { score: sc, pass } = score(fields);
+    let { score: sc, pass, gates_failed } = score(fields, loadTask(r.task));
     if (r.timeout) [sc, pass] = [0, false];
     if (sc !== r.score) {
       changed++;
       console.log(`${r.task} ${r.config} r${r.round}: ${r.score} -> ${sc}`);
     }
-    return JSON.stringify({ ...r, fields, score: sc, pass, false_success: r.claimed === "done" && !pass, lookups: trace ? leaks(trace) : r.lookups });
+    return JSON.stringify({ ...r, fields, score: sc, pass, gates_failed, false_success: r.claimed === "done" && !pass, lookups: trace ? leaks(trace) : r.lookups });
   });
   if (!argv.includes("--dry-run")) fs.writeFileSync(file, out.join("\n") + "\n");
 }

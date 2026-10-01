@@ -25,12 +25,14 @@
     {
       "name": "existing_tests_pass",
       "cmd": "touch crates/squawk-core/src/lib.rs; set -o pipefail; cargo test -p squawk-core --lib -- --skip context:: cleanup:: config:: dictionary:: hotkey:: ipc:: paths:: pipeline:: status:: store:: text:: 2>&1 | tee /dev/stderr | grep -Eq 'test result: ok\\. (10[2-9]|1[1-9][0-9]|[2-9][0-9][0-9]) passed'",
-      "expect_base": "pass"
+      "expect_base": "pass",
+      "gate": true
     },
     {
       "name": "spoken_file_names_become_mentions",
       "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_mentions",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "dotted_names_taken_whole",
@@ -40,7 +42,8 @@
     {
       "name": "spoken_folder_has_to_match",
       "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_folders",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "unsure_references_stay_as_spoken",
@@ -50,17 +53,20 @@
     {
       "name": "protected_text_left_alone",
       "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_protected",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "repo_terms_spelled_like_the_repo",
       "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_jargon",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "vocab_lists_the_repos_files",
       "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_vocab",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "vocab_cache_follows_the_repo",

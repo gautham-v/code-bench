@@ -2,8 +2,8 @@
 // Runs every (task, config) of a set with `claude -p --model <id> --effort <level>` and appends one
 // JSON line per run to results/<set>/runs.jsonl (private/results/<set>/ for a private task).
 //
-//   node bench.mjs --set hard --configs sonnet:high,opus:high [--rounds 2] [--concurrency 4]
-//                  [--tasks id,id] [--run-timeout-min 75] [--max-minutes 110] [--seed 7] [--dry-run]
+//   node bench.mjs --configs sonnet:high,opus:high [--rounds 2] [--concurrency 4] [--tasks id,id]
+//                  [--run-timeout-min 75] [--max-minutes 110] [--seed 7] [--set hard] [--dry-run]
 //
 // A config is model:effort. The model is an alias below or a full model id, so a new model needs
 // no change here: --configs claude-some-new-model:high.
@@ -167,7 +167,7 @@ async function runOne(cell) {
   const answer = answerOf(m.final_text, events);
   const trace = traceOf(events);
   const fields = scoredFields(graded.fields, trace);
-  let { score: sc, pass } = score(fields);
+  let { score: sc, pass, gates_failed } = score(fields, task);
   if (timedOut) [sc, pass] = [0, false];
   const rateLimited = events.some((e) => e.type === "rate_limit_event" && e.rate_limit_info?.status && e.rate_limit_info.status !== "allowed");
   // No result event and not a timeout: the CLI or API failed (auth, rate limit, crash), not the
@@ -186,7 +186,7 @@ async function runOne(cell) {
     task: task.id, set: task.set, config: config.id, model: config.model, effort: config.effort, round: cell.round, order: cell.order,
     started_at: new Date(started).toISOString(), wall_ms, first_tool_ms: m.first_tool_ms,
     timeout: timedOut, infra_error: infraError, rate_limited: rateLimited,
-    score: sc, pass, fields,
+    score: sc, pass, gates_failed, fields,
     // What the run said about itself, and whether it said done when a check failed.
     claimed: answer?.status ?? null, false_success: answer?.status === "done" && !pass, summary: answer?.summary ?? null,
     lookups: leaks(trace),
@@ -255,7 +255,7 @@ function doneKeys(rows) {
 }
 
 async function schedule() {
-  const SET = opt("set");
+  const SET = opt("set", SETS[0]);
   if (!SETS.includes(SET)) throw new Error(`--set must be one of ${SETS.join(", ")}`);
   if (!opt("configs")) throw new Error("--configs model:effort[,model:effort...] is required");
   const MAX_MIN = Number(opt("max-minutes", 110));

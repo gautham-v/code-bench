@@ -17,12 +17,14 @@
     {
       "name": "existing_tests_pass",
       "cmd": "bash heldout-check.sh existing",
-      "expect_base": "pass"
+      "expect_base": "pass",
+      "gate": true
     },
     {
       "name": "folds_follow_outside_edit",
       "cmd": "bash heldout-check.sh outside_edit_folds",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "cursor_on_screen_after_outside_edit",
@@ -32,7 +34,8 @@
     {
       "name": "folds_follow_renamed_or_moved_file",
       "cmd": "bash heldout-check.sh file_moves_folds",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "reading_view_has_the_folds",
@@ -42,7 +45,8 @@
     {
       "name": "search_hit_in_fold_is_shown",
       "cmd": "bash heldout-check.sh search_hit_in_fold",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     },
     {
       "name": "search_hit_matches_unsaved_buffer",
@@ -62,7 +66,8 @@
     {
       "name": "env_dir_not_written_to_settings",
       "cmd": "bash heldout-check.sh env_dir_not_saved",
-      "expect_base": "fail"
+      "expect_base": "fail",
+      "gate": true
     }
   ]
 }

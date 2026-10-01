@@ -89,7 +89,7 @@ if (cmd === "list") {
       fs.writeFileSync(file, rows.map((x) => JSON.stringify(x)).join("\n") + "\n");
     }
   }
-  console.log(`${done} rows regraded, ${changed} changed; run \`node rescore.mjs --set ${id}\` to apply`);
+  console.log(`${done} rows regraded, ${changed} changed; run \`node rescore.mjs\` to apply`);
 } else if (cmd === "verify") {
   const task = loadTask(id);
   let ok = true;
@@ -103,7 +103,7 @@ if (cmd === "list") {
       const got = g.fields[c.name];
       const good = got === want;
       if (!good) ok = false;
-      console.log(`  ${good ? "ok " : "BAD"} ${c.name}: ${got ? "pass" : "fail"} (expected ${want ? "pass" : "fail"}, ${g.outputs[c.name].ms} ms)`);
+      console.log(`  ${good ? "ok " : "BAD"} ${c.name}${c.gate ? " [gate]" : ""}: ${got ? "pass" : "fail"} (expected ${want ? "pass" : "fail"}, ${g.outputs[c.name].ms} ms)`);
       if (!good) console.log(g.outputs[c.name].tail.replace(/^/gm, "      "));
     }
     for (const e of g.errors) {

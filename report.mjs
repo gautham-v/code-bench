@@ -4,15 +4,14 @@
 // task with numbers only: scores.csv is what a reader without the private tasks can check the
 // tables against. Rows that failed for infrastructure reasons are left out; timeouts count as 0.
 //
-//   node report.mjs --set hard
+//   node report.mjs [--set hard]
 
 import fs from "node:fs";
 import path from "node:path";
-import { listTasks, resultsDir } from "./lib/workspace.mjs";
+import { listTasks, resultsDir, SETS } from "./lib/workspace.mjs";
 
 const argv = process.argv.slice(2);
-const SET = argv[argv.indexOf("--set") + 1];
-if (!argv.includes("--set") || !SET) throw new Error("--set easy|hard is required");
+const SET = argv.includes("--set") ? argv[argv.indexOf("--set") + 1] : SETS[0];
 
 const rows = [false, true]
   .flatMap((p) => {
@@ -21,6 +20,9 @@ const rows = [false, true]
   })
   .filter((r) => !r.infra_error);
 const isPrivate = Object.fromEntries(listTasks().map((t) => [t.id, t.private]));
+// A task's gates: checks every model measured so far has met. They are needed to pass and earn no score.
+const gates = Object.fromEntries(listTasks().map((t) => [t.id, new Set(t.checks.filter((c) => c.gate).map((c) => c.name))]));
+const isGate = (t, k) => gates[t]?.has(k) ?? false;
 
 const MODEL_ORDER = ["haiku", "sonnet", "opus", "fable"];
 const EFFORT_ORDER = ["default", "low", "medium", "high", "xhigh", "max"];
@@ -43,17 +45,17 @@ const median = (xs) => {
 };
 const f = (v, d = 2) => (Number.isFinite(v) ? v.toFixed(d) : "–");
 const dur = (s) => (!Number.isFinite(s) ? "–" : s < 120 ? `${s.toFixed(0)} s` : `${(s / 60).toFixed(1)} min`);
-const checks = (rs) => rs.flatMap((r) => Object.values(r.fields ?? {}));
+const checks = (rs) => rs.flatMap((r) => Object.entries(r.fields ?? {}).filter(([k]) => !isGate(r.task, k)).map(([, v]) => v));
 const out = (r) => (r.model_usage ? Object.values(r.model_usage).reduce((a, u) => a + (u.outputTokens ?? 0), 0) : r.usage?.output_tokens) ?? NaN;
 const name = (t) => `${t}${isPrivate[t] ? " (private)" : ""}`;
 
-let md = `# ${SET}: ${rows.length} runs\n\nCost is the CLI's list-price \`total_cost_usd\`. A run passes when it meets every check of its task; score is the share of checks met. Tasks marked private come from repos that aren't public, so their prompts, tests and diffs aren't in this repo; their numbers are.\n`;
+let md = `# ${SET}: ${rows.length} runs\n\nCost is the CLI's list-price \`total_cost_usd\`. A run passes when it meets every check of its task, gates included; score is the share of its scored checks met. A gate is a check every model measured so far has met, so it earns nothing. Tasks marked private come from repos that aren't public, so their prompts, tests and diffs aren't in this repo; their numbers are.\n`;
 
-md += `\n## Per config\n\n| config | runs | passed | checks met | mean score | said done but failed | timeouts | wall, mean | wall, median | cost, mean | tool calls, median | output tokens, median | lines +/−, median |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n`;
+md += `\n## Per config\n\n| config | runs | passed | scored checks met | mean score | gates failed | said done but failed | timeouts | wall, mean | wall, median | cost, mean | tool calls, median | output tokens, median | lines +/−, median |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n`;
 for (const c of configs) {
   const rs = rows.filter((r) => r.config === c);
   const ch = checks(rs);
-  md += `| ${short(c)} | ${rs.length} | ${rs.filter((r) => r.pass).length} | ${ch.filter(Boolean).length}/${ch.length} | ${f(mean(rs.map((r) => r.score)), 3)} | ${rs.filter((r) => r.false_success).length} | ${rs.filter((r) => r.timeout).length} | ${dur(mean(rs.map((r) => r.wall_ms / 1000)))} | ${dur(median(rs.map((r) => r.wall_ms / 1000)))} | $${f(mean(rs.map((r) => r.cost_usd ?? NaN)))} | ${f(median(rs.map((r) => r.tool_calls)), 0)} | ${f(median(rs.map(out)), 0)} | +${f(median(rs.map((r) => r.lines_added)), 0)} / −${f(median(rs.map((r) => r.lines_removed)), 0)} |\n`;
+  md += `| ${short(c)} | ${rs.length} | ${rs.filter((r) => r.pass).length} | ${ch.filter(Boolean).length}/${ch.length} | ${f(mean(rs.map((r) => r.score)), 3)} | ${rs.reduce((a, r) => a + (r.gates_failed ?? 0), 0)} | ${rs.filter((r) => r.false_success).length} | ${rs.filter((r) => r.timeout).length} | ${dur(mean(rs.map((r) => r.wall_ms / 1000)))} | ${dur(median(rs.map((r) => r.wall_ms / 1000)))} | $${f(mean(rs.map((r) => r.cost_usd ?? NaN)))} | ${f(median(rs.map((r) => r.tool_calls)), 0)} | ${f(median(rs.map(out)), 0)} | +${f(median(rs.map((r) => r.lines_added)), 0)} / −${f(median(rs.map((r) => r.lines_removed)), 0)} |\n`;
 }
 
 const cell = (t, c, fn) => {
@@ -66,10 +68,10 @@ for (const t of tasks) md += `| ${name(t)} | ${configs.map((c) => cell(t, c, (r)
 md += `\n## Wall time by task and round\n\n| task | ${configs.map(short).join(" | ")} |\n|---|${configs.map(() => "---").join("|")}|\n`;
 for (const t of tasks) md += `| ${name(t)} | ${configs.map((c) => cell(t, c, (r) => dur(r.wall_ms / 1000))).join(" | ")} |\n`;
 
-md += `\n## Checks, by how many runs met them\n\n| task | check | ${configs.map(short).join(" | ")} |\n|---|---|${configs.map(() => "---").join("|")}|\n`;
+md += `\n## Checks, by how many runs met them\n\n| task | check | kind | ${configs.map(short).join(" | ")} |\n|---|---|---|${configs.map(() => "---").join("|")}|\n`;
 for (const t of tasks) {
   for (const k of [...new Set(rows.filter((r) => r.task === t).flatMap((r) => Object.keys(r.fields ?? {})))]) {
-    md += `| ${name(t)} | ${k} | ${configs
+    md += `| ${name(t)} | ${k} | ${isGate(t, k) ? "gate" : "scored"} | ${configs
       .map((c) => {
         const rs = rows.filter((r) => r.task === t && r.config === c && k in (r.fields ?? {}));
         return rs.length ? `${rs.filter((r) => r.fields[k]).length}/${rs.length}` : "";
@@ -84,10 +86,10 @@ if (marked.length) {
   for (const r of marked) md += `| ${name(r.task)} | ${short(r.config)} | ${r.round} | ${r.lookups.map((l) => l.kind).join(", ")} |\n`;
 }
 
-const csv = ["task,private,config,round,score,pass,checks_met,checks,claimed,wall_s,cost_usd,tool_calls,turns,output_tokens,lines_added,lines_removed,timeout"];
+const csv = ["task,private,config,round,score,pass,scored_met,scored,gates_failed,claimed,wall_s,cost_usd,tool_calls,turns,output_tokens,lines_added,lines_removed,timeout"];
 for (const r of [...rows].sort((a, b) => a.task.localeCompare(b.task) || byOrder(a.config, b.config) || a.round - b.round)) {
-  const v = Object.values(r.fields ?? {});
-  csv.push([r.task, isPrivate[r.task] ? 1 : 0, r.config, r.round, r.score, r.pass ? 1 : 0, v.filter(Boolean).length, v.length, r.claimed ?? "", (r.wall_ms / 1000).toFixed(0), (r.cost_usd ?? 0).toFixed(3), r.tool_calls, r.turns ?? "", out(r) || "", r.lines_added, r.lines_removed, r.timeout ? 1 : 0].join(","));
+  const v = checks([r]);
+  csv.push([r.task, isPrivate[r.task] ? 1 : 0, r.config, r.round, r.score, r.pass ? 1 : 0, v.filter(Boolean).length, v.length, r.gates_failed ?? 0, r.claimed ?? "", (r.wall_ms / 1000).toFixed(0), (r.cost_usd ?? 0).toFixed(3), r.tool_calls, r.turns ?? "", out(r) || "", r.lines_added, r.lines_removed, r.timeout ? 1 : 0].join(","));
 }
 
 const dir = resultsDir(SET);

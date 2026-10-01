@@ -31,7 +31,7 @@ const fix = git(src, "rev-parse", "HEAD");
 write(path.join(src, "untracked/dep.txt"), "dep\n");
 
 const toy = {
-  id: "toy-add", set: "easy", repo: "toy", base, fix, prompt: "add() subtracts", clone: ["untracked"], protected: ["old.test.mjs"],
+  id: "toy-add", set: "hard", repo: "toy", base, fix, prompt: "add() subtracts", clone: ["untracked"], protected: ["old.test.mjs"],
   env: { BUILD_DIR: "{root}/build" }, warm: 'mkdir -p "$BUILD_DIR" && echo built > "$BUILD_DIR/dep.o"',
   checks: [
     { name: "adds", cmd: "node hidden.test.mjs", expect_base: "fail" },
@@ -42,7 +42,7 @@ const toy = {
 write(path.join(root, "repos.json"), JSON.stringify({ toy: { path: src } }));
 write(path.join(root, "tasks/toy-add/task.json"), JSON.stringify(toy));
 write(path.join(root, "tasks/toy-add/hidden/hidden.test.mjs"), "import { add } from './add.mjs';\nif (add(2, 3) !== 5) process.exit(1);\n");
-write(path.join(root, "private/tasks/toy-private/task.json"), JSON.stringify({ ...toy, id: "toy-private", set: "hard" }));
+write(path.join(root, "private/tasks/toy-private/task.json"), JSON.stringify({ ...toy, id: "toy-private" }));
 
 process.env.CODE_BENCH_DIR = root;
 const { grade, leaks, listTasks, loadTask, prepare, resultsDir, runEnv, score, scoredFields, warm } = await import("../lib/workspace.mjs");
@@ -53,9 +53,9 @@ const workspace = () => {
 };
 
 test("tasks are found in tasks/ and private/tasks/, and a private task's results go under private/", () => {
-  assert.deepEqual(listTasks().map((t) => [t.id, t.set, t.private]), [["toy-add", "easy", false], ["toy-private", "hard", true]]);
+  assert.deepEqual(listTasks().map((t) => [t.id, t.set, t.private]), [["toy-add", "hard", false], ["toy-private", "hard", true]]);
   assert.equal(resultsDir("hard", loadTask("toy-private").private), path.join(root, "private/results/hard"));
-  assert.equal(resultsDir("easy", loadTask("toy-add").private), path.join(root, "results/easy"));
+  assert.equal(resultsDir("hard", loadTask("toy-add").private), path.join(root, "results/hard"));
   assert.throws(() => loadTask("nope"), /no task nope/);
 });
 
@@ -76,11 +76,19 @@ test("an untouched base fails the task's check and keeps the old test passing; t
   const atBase = grade(task, dir, prepare(task, dir));
   assert.deepEqual(atBase.fields, { adds: false, old_test: true, build_dir_set: true });
   assert.equal(atBase.patch, "");
-  assert.deepEqual(score(atBase.fields), { score: 0.667, pass: false });
+  assert.deepEqual(score(atBase.fields, task), { score: 0.667, pass: false, gates_failed: 0 });
   const fixed = workspace();
   const atFix = grade(task, fixed, prepare(task, fixed, task.fix));
   assert.deepEqual(atFix.fields, { adds: true, old_test: true, build_dir_set: true });
-  assert.deepEqual(score(atFix.fields), { score: 1, pass: true });
+  assert.deepEqual(score(atFix.fields, task), { score: 1, pass: true, gates_failed: 0 });
+});
+
+test("a gate earns no score but a run must meet it to pass", () => {
+  const task = { checks: [{ name: "old_test", gate: true }, { name: "adds" }, { name: "edge" }] };
+  assert.deepEqual(score({ old_test: true, adds: true, edge: false }, task), { score: 0.5, pass: false, gates_failed: 0 });
+  assert.deepEqual(score({ old_test: true, adds: true, edge: true }, task), { score: 1, pass: true, gates_failed: 0 });
+  assert.deepEqual(score({ old_test: false, adds: true, edge: true }, task), { score: 1, pass: false, gates_failed: 1 });
+  assert.deepEqual(score({ old_test: false, adds: false, edge: false, no_lookup: false }, task).score, 0);
 });
 
 test("the diff counts committed and uncommitted work, and a weakened protected test is put back", () => {

@@ -1,27 +1,27 @@
 # hard: 44 runs
 
-Cost is the CLI's list-price `total_cost_usd`. A run passes when it meets every check of its task; score is the share of checks met. Tasks marked private come from repos that aren't public, so their prompts, tests and diffs aren't in this repo; their numbers are.
+Cost is the CLI's list-price `total_cost_usd`. A run passes when it meets every check of its task, gates included; score is the share of its scored checks met. A gate is a check every model measured so far has met, so it earns nothing. Tasks marked private come from repos that aren't public, so their prompts, tests and diffs aren't in this repo; their numbers are.
 
 ## Per config
 
-| config | runs | passed | checks met | mean score | said done but failed | timeouts | wall, mean | wall, median | cost, mean | tool calls, median | output tokens, median | lines +/−, median |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| sonnet medium | 4 | 0 | 24/40 | 0.600 | 4 | 0 | 3.2 min | 2.9 min | $0.52 | 16 | 19836 | +276 / −6 |
-| sonnet high | 8 | 0 | 67/80 | 0.838 | 8 | 0 | 6.4 min | 6.7 min | $1.16 | 27 | 46149 | +509 / −14 |
-| sonnet xhigh | 4 | 1 | 37/40 | 0.925 | 3 | 0 | 22.6 min | 16.5 min | $3.64 | 57 | 118486 | +999 / −29 |
-| opus medium | 8 | 2 | 69/80 | 0.863 | 6 | 0 | 12.5 min | 10.2 min | $3.14 | 24 | 56006 | +841 / −23 |
-| opus high | 8 | 5 | 76/80 | 0.950 | 3 | 0 | 22.5 min | 20.7 min | $5.76 | 46 | 112259 | +1028 / −35 |
-| fable low | 8 | 3 | 73/80 | 0.912 | 5 | 0 | 8.4 min | 7.3 min | $4.88 | 19 | 39722 | +611 / −20 |
-| fable medium | 4 | 1 | 36/40 | 0.900 | 3 | 0 | 14.0 min | 14.1 min | $7.71 | 26 | 74869 | +887 / −29 |
+| config | runs | passed | scored checks met | mean score | gates failed | said done but failed | timeouts | wall, mean | wall, median | cost, mean | tool calls, median | output tokens, median | lines +/−, median |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sonnet medium | 4 | 0 | 2/18 | 0.083 | 0 | 4 | 0 | 3.2 min | 2.9 min | $0.52 | 16 | 19836 | +276 / −6 |
+| sonnet high | 8 | 0 | 23/36 | 0.585 | 0 | 8 | 0 | 6.4 min | 6.7 min | $1.16 | 27 | 46149 | +509 / −14 |
+| sonnet xhigh | 4 | 1 | 15/18 | 0.804 | 0 | 3 | 0 | 22.6 min | 16.5 min | $3.64 | 57 | 118486 | +999 / −29 |
+| opus medium | 8 | 2 | 25/36 | 0.688 | 0 | 6 | 0 | 12.5 min | 10.2 min | $3.14 | 24 | 56006 | +841 / −23 |
+| opus high | 8 | 5 | 32/36 | 0.902 | 0 | 3 | 0 | 22.5 min | 20.7 min | $5.76 | 46 | 112259 | +1028 / −35 |
+| fable low | 8 | 3 | 29/36 | 0.750 | 0 | 5 | 0 | 8.4 min | 7.3 min | $4.88 | 19 | 39722 | +611 / −20 |
+| fable medium | 4 | 1 | 14/18 | 0.804 | 0 | 3 | 0 | 14.0 min | 14.1 min | $7.71 | 26 | 74869 | +887 / −29 |
 
 ## Score by task and round
 
 | task | sonnet medium | sonnet high | sonnet xhigh | opus medium | opus high | fable low | fable medium |
 |---|---|---|---|---|---|---|---|
-| catcher-big-feature | 0.6 | 0.9 / 0.8 | 1 | 0.6 / 0.8 | 1 / 0.8 | 0.9 / 1 | 0.8 |
-| catcher-deep-bug | 0.5 | 0.9 / 0.9 | 0.9 | 1 / 1 | 0.9 / 1 | 1 / 1 | 0.9 |
-| sidecar-hard (private) | 0.7 | 0.8 / 0.7 | 0.9 | 0.9 / 0.8 | 1 / 1 | 0.8 / 0.8 | 1 |
-| squawk-hard | 0.6 | 0.9 / 0.8 | 0.9 | 0.9 / 0.9 | 1 / 0.9 | 0.9 / 0.9 | 0.9 |
+| catcher-big-feature | 0.33 | 0.83 / 0.67 | 1 | 0.33 / 0.67 | 1 / 0.67 | 0.83 / 1 | 0.67 |
+| catcher-deep-bug | 0 | 0.8 / 0.8 | 0.8 | 1 / 1 | 0.8 / 1 | 1 / 1 | 0.8 |
+| sidecar-hard (private) | 0 | 0.33 / 0 | 0.67 | 0.67 / 0.33 | 1 / 1 | 0.33 / 0.33 | 1 |
+| squawk-hard | 0 | 0.75 / 0.5 | 0.75 | 0.75 / 0.75 | 1 / 0.75 | 0.75 / 0.75 | 0.75 |
 
 ## Wall time by task and round
 
@@ -34,48 +34,48 @@ Cost is the CLI's list-price `total_cost_usd`. A run passes when it meets every 
 
 ## Checks, by how many runs met them
 
-| task | check | sonnet medium | sonnet high | sonnet xhigh | opus medium | opus high | fable low | fable medium |
-|---|---|---|---|---|---|---|---|---|
-| catcher-big-feature | existing_tests_pass | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-big-feature | plain_editing_unchanged | 1/1 | 1/2 | 1/1 | 2/2 | 2/2 | 2/2 | 0/1 |
-| catcher-big-feature | same_number_lists_left_alone | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-big-feature | paste_joins_count | 0/1 | 2/2 | 1/1 | 0/2 | 1/2 | 2/2 | 1/1 |
-| catcher-big-feature | nested_lists_count_separately | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-big-feature | code_and_other_lists_untouched | 1/1 | 2/2 | 1/1 | 1/2 | 2/2 | 2/2 | 1/1 |
-| catcher-big-feature | enter_delete_move_recount | 0/1 | 1/2 | 1/1 | 0/2 | 1/2 | 2/2 | 1/1 |
-| catcher-big-feature | tab_nests_shift_tab_unnests | 0/1 | 1/2 | 1/1 | 1/2 | 2/2 | 1/2 | 0/1 |
-| catcher-big-feature | edit_is_one_undo_step | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-big-feature | cursor_stays_on_its_text | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | existing_tests_pass | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | folds_follow_outside_edit | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | cursor_on_screen_after_outside_edit | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | folds_follow_renamed_or_moved_file | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | reading_view_has_the_folds | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | search_hit_in_fold_is_shown | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | search_hit_matches_unsaved_buffer | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | search_hit_gone_keeps_cursor | 0/1 | 0/2 | 0/1 | 2/2 | 1/2 | 2/2 | 0/1 |
-| catcher-deep-bug | heading_link_is_not_a_tag | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| catcher-deep-bug | env_dir_not_written_to_settings | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| sidecar-hard (private) | existing_tests_pass | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| sidecar-hard (private) | auto_cue_basics_hold | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| sidecar-hard (private) | card_in_use_is_kept | 0/1 | 0/2 | 1/1 | 2/2 | 2/2 | 1/2 | 1/1 |
-| sidecar-hard (private) | unfinished_ask_not_cued | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| sidecar-hard (private) | acknowledgement_not_cued | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| sidecar-hard (private) | fire_dropped_when_room_goes_on | 0/1 | 1/2 | 1/1 | 1/2 | 2/2 | 1/2 | 1/1 |
-| sidecar-hard (private) | queued_fire_not_released_on_half_ask | 0/1 | 0/2 | 0/1 | 0/2 | 2/2 | 0/2 | 1/1 |
-| sidecar-hard (private) | talked_over_cue_redone_for_whole_ask | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| sidecar-hard (private) | hotkey_routes_on_new_words | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| sidecar-hard (private) | answered_card_dims | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | existing_tests_pass | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | spoken_file_names_become_mentions | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | dotted_names_taken_whole | 0/1 | 0/2 | 0/1 | 0/2 | 1/2 | 0/2 | 0/1 |
-| squawk-hard | spoken_folder_has_to_match | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | unsure_references_stay_as_spoken | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | protected_text_left_alone | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | repo_terms_spelled_like_the_repo | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | vocab_lists_the_repos_files | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | vocab_cache_follows_the_repo | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
-| squawk-hard | finds_the_agent_session | 0/1 | 1/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| task | check | kind | sonnet medium | sonnet high | sonnet xhigh | opus medium | opus high | fable low | fable medium |
+|---|---|---|---|---|---|---|---|---|---|
+| catcher-big-feature | existing_tests_pass | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-big-feature | plain_editing_unchanged | scored | 1/1 | 1/2 | 1/1 | 2/2 | 2/2 | 2/2 | 0/1 |
+| catcher-big-feature | same_number_lists_left_alone | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-big-feature | paste_joins_count | scored | 0/1 | 2/2 | 1/1 | 0/2 | 1/2 | 2/2 | 1/1 |
+| catcher-big-feature | nested_lists_count_separately | scored | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-big-feature | code_and_other_lists_untouched | scored | 1/1 | 2/2 | 1/1 | 1/2 | 2/2 | 2/2 | 1/1 |
+| catcher-big-feature | enter_delete_move_recount | scored | 0/1 | 1/2 | 1/1 | 0/2 | 1/2 | 2/2 | 1/1 |
+| catcher-big-feature | tab_nests_shift_tab_unnests | scored | 0/1 | 1/2 | 1/1 | 1/2 | 2/2 | 1/2 | 0/1 |
+| catcher-big-feature | edit_is_one_undo_step | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-big-feature | cursor_stays_on_its_text | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | existing_tests_pass | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | folds_follow_outside_edit | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | cursor_on_screen_after_outside_edit | scored | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | folds_follow_renamed_or_moved_file | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | reading_view_has_the_folds | scored | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | search_hit_in_fold_is_shown | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | search_hit_matches_unsaved_buffer | scored | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | search_hit_gone_keeps_cursor | scored | 0/1 | 0/2 | 0/1 | 2/2 | 1/2 | 2/2 | 0/1 |
+| catcher-deep-bug | heading_link_is_not_a_tag | scored | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| catcher-deep-bug | env_dir_not_written_to_settings | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| sidecar-hard (private) | existing_tests_pass | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| sidecar-hard (private) | auto_cue_basics_hold | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| sidecar-hard (private) | card_in_use_is_kept | scored | 0/1 | 0/2 | 1/1 | 2/2 | 2/2 | 1/2 | 1/1 |
+| sidecar-hard (private) | unfinished_ask_not_cued | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| sidecar-hard (private) | acknowledgement_not_cued | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| sidecar-hard (private) | fire_dropped_when_room_goes_on | scored | 0/1 | 1/2 | 1/1 | 1/2 | 2/2 | 1/2 | 1/1 |
+| sidecar-hard (private) | queued_fire_not_released_on_half_ask | scored | 0/1 | 0/2 | 0/1 | 0/2 | 2/2 | 0/2 | 1/1 |
+| sidecar-hard (private) | talked_over_cue_redone_for_whole_ask | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| sidecar-hard (private) | hotkey_routes_on_new_words | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| sidecar-hard (private) | answered_card_dims | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | existing_tests_pass | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | spoken_file_names_become_mentions | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | dotted_names_taken_whole | scored | 0/1 | 0/2 | 0/1 | 0/2 | 1/2 | 0/2 | 0/1 |
+| squawk-hard | spoken_folder_has_to_match | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | unsure_references_stay_as_spoken | scored | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | protected_text_left_alone | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | repo_terms_spelled_like_the_repo | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | vocab_lists_the_repos_files | gate | 1/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | vocab_cache_follows_the_repo | scored | 0/1 | 2/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
+| squawk-hard | finds_the_agent_session | scored | 0/1 | 1/2 | 1/1 | 2/2 | 2/2 | 2/2 | 1/1 |
 
 ## Rows the lookup guard marked
 
