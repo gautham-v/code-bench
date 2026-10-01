@@ -1,0 +1,359 @@
+diff --git a/src/app.rs b/src/app.rs
+index 016bc69..9ef8a9d 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -683,6 +683,31 @@ impl App {
+         }
+     }
+ 
++    /// Fold the heading on `row` if it is open, open it if it is folded: what
++    /// a click on a heading in the reading view does. Whether the line was a
++    /// heading with something to fold (or a fold to open) at all.
++    fn toggle_fold_at(&mut self, row: usize) -> bool {
++        let path = self.notes[self.active].path.clone();
++        let blocks = self.blocks();
++        if crate::fold::heading_at(self.editor.lines(), &blocks, row).is_none() {
++            return false;
++        }
++        let done = if self.folds.is_folded(&path, row) {
++            self.folds.unfold(&path, row)
++        } else {
++            self.folds
++                .fold(&path, self.editor.lines(), &blocks, row)
++                .is_some()
++        };
++        if done {
++            self.refresh_visible();
++            // the cursor may have been inside a section that just closed
++            let at = self.editor.cursor.0;
++            self.leave_folds(at);
++        }
++        done
++    }
++
+     fn unfold_section(&mut self) {
+         let path = self.notes[self.active].path.clone();
+         if self.folds.unfold(&path, self.editor.cursor.0) {
+@@ -852,6 +877,7 @@ impl App {
+                 // just typed turn up in the footer of the note it names
+                 self.mentions.invalidate();
+                 if now != path {
++                    self.folds.rekey(&path, &now);
+                     if let Some(done) = self.update_links(&path, &now) {
+                         self.flash(format!("renamed · {done}"));
+                     }
+@@ -932,6 +958,14 @@ impl App {
+         self.editor.replace_all(&self.notes[self.active].content);
+         self.dirty = false;
+         self.mentions.invalidate();
++        // the folds were made against the old text: follow their headings
++        // into the new one before the line → row map is rebuilt
++        let path = self.notes[self.active].path.clone();
++        let blocks = self.blocks();
++        self.folds.settle(&path, self.editor.lines(), &blocks);
++        self.refresh_visible();
++        let row = self.editor.cursor.0;
++        self.leave_folds(row);
+         self.flash(if dropped {
+             "reloaded: changed on disk, your last edits were dropped".to_string()
+         } else {
+@@ -1484,10 +1518,27 @@ impl App {
+     fn enter_contents(&mut self) {
+         self.contents = true;
+         self.selected = 0;
++        // a note this session holds is searched as it stands in memory, not
++        // as the disk has it: the line a hit names is a line of the buffer
++        // the note opens into, edits not yet saved included
++        let open: Vec<(PathBuf, &str)> = self
++            .notes
++            .iter()
++            .map(|n| {
++                let p = std::fs::canonicalize(&n.path).unwrap_or_else(|_| n.path.clone());
++                (p, n.content.as_str())
++            })
++            .collect();
+         self.contents_bodies = self
+             .open_index
+             .iter()
+-            .map(|e| crate::contents::body_of(&e.path))
++            .map(|e| {
++                let p = std::fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone());
++                match open.iter().find(|(o, _)| *o == p) {
++                    Some((_, content)) => Some(content.to_string()),
++                    None => crate::contents::body_of(&e.path),
++                }
++            })
+             .collect();
+     }
+ 
+@@ -1510,6 +1561,8 @@ impl App {
+         };
+         self.open_path(&path);
+         self.editor.set_cursor((line, 0));
++        // the line may sit inside a fold; what was searched for must be seen
++        self.reveal_cursor();
+         self.preview_goto = Some(line);
+     }
+ 
+@@ -1880,8 +1933,10 @@ impl App {
+     /// if the folder already has one by that name); the title is untouched.
+     fn commit_move(&mut self, dir: &Path) {
+         let label = self.move_label(dir);
++        let old = self.active_note().path.clone();
+         match notes::move_file(&mut self.notes[self.active], dir) {
+             Ok(path) => {
++                self.folds.rekey(&old, &path);
+                 let name = path
+                     .file_name()
+                     .map(|n| n.to_string_lossy().into_owned())
+@@ -1919,6 +1974,7 @@ impl App {
+         let old = self.active_note().path.clone();
+         match notes::rename_file(&mut self.notes[self.active], &stem) {
+             Ok(path) => {
++                self.folds.rekey(&old, &path);
+                 let name = path
+                     .file_name()
+                     .map(|n| n.to_string_lossy().into_owned())
+@@ -2498,6 +2554,14 @@ impl App {
+             self.toggle_checkbox(row);
+             return;
+         }
++        let heading = self
++            .preview_rows
++            .iter()
++            .find(|(r, _, _)| r.contains(at))
++            .and_then(|(_, row, _)| *row);
++        if heading.is_some_and(|row| self.toggle_fold_at(row)) {
++            return;
++        }
+         if self.config.preview_click == PreviewClick::Edit {
+             self.edit_at_preview(x, y);
+             return;
+diff --git a/src/config.rs b/src/config.rs
+index 9bdd706..a135ea9 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -277,9 +277,10 @@ impl Config {
+                 .ok()
+                 .and_then(|p| fs::read_to_string(p).ok())
+                 .unwrap_or_default();
+-            let migrated = Config::from_str(&seed);
+-            write_settings(&path, &migrated)?;
+-            return Ok(migrated);
++            // what is written is what the file says, never the one-off
++            // environment override the session runs with
++            write_settings(&path, &Config::parse(&seed, false))?;
++            return Ok(Config::from_str(&seed));
+         }
+         let text =
+             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+@@ -289,7 +290,7 @@ impl Config {
+         // not have. Rewriting is safe because the document is generated from
+         // the config the file was just parsed into: every value survives.
+         if !covers_every_setting(&text, &config) {
+-            let _ = write_settings(&path, &config);
++            let _ = write_settings(&path, &Config::parse(&text, false));
+         }
+         Ok(config)
+     }
+@@ -305,6 +306,13 @@ impl Config {
+ 
+     #[allow(clippy::should_implement_trait)]
+     pub fn from_str(text: &str) -> Config {
++        Config::parse(text, true)
++    }
++
++    /// The settings `text` says. With `env` the environment's one-off
++    /// overrides (`CATCHER_DIR`) are applied on top, as for a running
++    /// session; without it, only what the file itself holds.
++    fn parse(text: &str, env: bool) -> Config {
+         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+         let mut c = Config::default();
+ 
+@@ -313,8 +321,9 @@ impl Config {
+             c.attachments_dir = c.notes_dir.join("attachments");
+         }
+         // the environment wins: it is how a one-off session is pointed elsewhere
+-        if let Some(d) =
+-            std::env::var_os("CATCHER_DIR").or_else(|| std::env::var_os("TINYNOTE_DIR"))
++        if let Some(d) = std::env::var_os("CATCHER_DIR")
++            .or_else(|| std::env::var_os("TINYNOTE_DIR"))
++            .filter(|_| env)
+         {
+             c.notes_dir = PathBuf::from(d);
+             c.attachments_dir = c.notes_dir.join("attachments");
+@@ -928,6 +937,12 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn the_environment_override_is_not_part_of_what_a_file_says() {
++        let c = Config::parse("- notes_dir: /vault\n", false);
++        assert_eq!(c.notes_dir, PathBuf::from("/vault"));
++    }
++
+     #[test]
+     fn quick_open_can_be_told_to_open_on_the_tree_instead_of_the_list() {
+         assert!(!Config::default().quick_open_browse);
+diff --git a/src/fold.rs b/src/fold.rs
+index 3b6380d..d18d0b9 100644
+--- a/src/fold.rs
++++ b/src/fold.rs
+@@ -96,6 +96,16 @@ impl Folds {
+         Some(to + 1 - from)
+     }
+ 
++    /// The note at `old` now lives at `new`: its folds go with it.
++    pub fn rekey(&mut self, old: &Path, new: &Path) {
++        if old == new {
++            return;
++        }
++        if let Some(m) = self.by_note.remove(old) {
++            self.by_note.insert(new.to_path_buf(), m);
++        }
++    }
++
+     /// Open the fold on `row`. Whether there was one.
+     pub fn unfold(&mut self, path: &Path, row: usize) -> bool {
+         let Some(m) = self.by_note.get_mut(path) else {
+@@ -387,6 +397,16 @@ mod tests {
+         assert_eq!(v.rows(), 1);
+     }
+ 
++    #[test]
++    fn folds_follow_a_note_to_its_new_path() {
++        let (l, b) = note();
++        let mut f = Folds::default();
++        f.fold(Path::new("a.md"), &l, &b, 2);
++        f.rekey(Path::new("a.md"), Path::new("sub/b.md"));
++        assert!(f.of(Path::new("a.md")).is_empty());
++        assert_eq!(f.of(Path::new("sub/b.md")), vec![2]);
++    }
++
+     #[test]
+     fn folds_are_kept_per_note() {
+         let (l, b) = note();
+diff --git a/src/md.rs b/src/md.rs
+index 931078c..116a779 100644
+--- a/src/md.rs
++++ b/src/md.rs
+@@ -1199,6 +1199,10 @@ pub fn tag_at(src: &[char], i: usize) -> Option<usize> {
+     if src.get(i) != Some(&'#') || !tag_boundary(i.checked_sub(1).map(|k| src[k])) {
+         return None;
+     }
++    // `[[#heading]]` is a link to a heading of this note, not a tag
++    if i >= 2 && src[i - 2] == '[' && src[i - 1] == '[' {
++        return None;
++    }
+     if !src.get(i + 1).is_some_and(|c| c.is_alphabetic()) {
+         return None;
+     }
+@@ -2717,6 +2721,8 @@ mod tests {
+         assert!(ends("#1 and # and #").is_empty());
+         // nor is anything glued to the word before it
+         assert!(ends("a#b c&#d").is_empty());
++        // a link to a heading of the same note is not a tag
++        assert!(ends("see [[#Setup]] and [[#Setup|here]]").is_empty());
+     }
+ 
+     #[test]
+diff --git a/src/ui.rs b/src/ui.rs
+index 3f74bd3..56e99e9 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -203,6 +203,48 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
+     }
+ }
+ 
++/// Drop the rendered lines a fold hides. A line the renderer made up — the
++/// blank between blocks — goes when the source line after it does.
++fn drop_hidden(lines: &mut Vec<crate::render::PLine>, visible: &crate::fold::Visible) {
++    let mut hidden = vec![false; lines.len()];
++    let mut next: Option<bool> = None;
++    for (i, l) in lines.iter().enumerate().rev() {
++        if let Some(src) = l.src_line {
++            next = Some(visible.is_hidden(src));
++        }
++        hidden[i] = next.unwrap_or(false);
++    }
++    // a trailing blank has nothing after it: it follows what came before
++    let tail = lines
++        .iter()
++        .rposition(|l| l.src_line.is_some())
++        .map_or(0, |i| i + 1);
++    if let Some(last) = lines[..tail].last().and_then(|l| l.src_line) {
++        hidden[tail..]
++            .iter_mut()
++            .for_each(|h| *h = visible.is_hidden(last));
++    }
++    let mut keep = hidden.into_iter().map(|h| !h);
++    lines.retain(|_| keep.next().unwrap_or(true));
++}
++
++/// [`fold_note`] for the reading view's cells.
++fn fold_cells(cells: &mut Vec<PCell>, label: &str, width: usize) {
++    let used = crate::render::cells_width(cells);
++    let need = crate::md::str_width(label) + 2;
++    if used + need > width {
++        return;
++    }
++    let style = dim();
++    let pad = std::iter::repeat(' ').take(width - used - need + 2);
++    cells.extend(pad.chain(label.chars()).map(|ch| PCell {
++        ch,
++        style,
++        link: None,
++        src: None,
++    }));
++}
++
+ /// Put a folded heading's count at the right edge of its first row, when the
+ /// row has room for it and a gap besides; a heading that fills the page keeps
+ /// its text, and the marker in front already says it is folded.
+@@ -270,6 +312,30 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+         .map_or((0, 0), |r| (r.end, content[..r.end].lines().count()));
+     let mut rendered =
+         crate::render::render_page_at(&content[skip..], first, width, app.config.table_style);
++    // folds hide the same lines here as in the editor
++    if !app.visible.is_plain() {
++        drop_hidden(&mut rendered.lines, &app.visible);
++    }
++    // a folded heading carries its marker, and says how much it hides
++    let mut folded_rows: Vec<(usize, String)> = Vec::new();
++    let mut marked_heading = None;
++    for pline in rendered.lines.iter_mut() {
++        let Some(src) = pline.src_line else { continue };
++        if marked_heading == Some(src) || !app.folded_here(src) {
++            continue;
++        }
++        marked_heading = Some(src);
++        let marker = crate::md::theme::FOLDED.chars().map(|ch| PCell {
++            ch,
++            style: theme::fold(),
++            link: None,
++            src: Some((src, 0)),
++        });
++        pline.cells.splice(0..0, marker.collect::<Vec<_>>());
++        if let Some(label) = app.fold_label(src) {
++            folded_rows.push((src, label));
++        }
++    }
+     // the footer arrives a frame or two late by design: the scan behind it
+     // reads every note body under the roots, and a page that waited for that
+     // would be a page that stuttered on every open
+@@ -316,7 +382,14 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+             });
+             continue;
+         }
+-        for (i, cells) in wrap_cells(&pline.cells, width).into_iter().enumerate() {
++        let label = pline
++            .src_line
++            .and_then(|l| folded_rows.iter().find(|(s, _)| *s == l))
++            .map(|(_, label)| label.as_str());
++        for (i, mut cells) in wrap_cells(&pline.cells, width).into_iter().enumerate() {
++            if let Some(label) = label.filter(|_| i == 0) {
++                fold_cells(&mut cells, label, width);
++            }
+             rows.push(Row {
+                 cells,
+                 checkbox: if i == 0 { pline.checkbox } else { None },

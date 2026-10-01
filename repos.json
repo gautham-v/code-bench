@@ -1,0 +1,7 @@
+{
+  "catcher": { "path": "~/Code/personal/catcher", "url": "https://github.com/gautham-v/catcher" },
+  "squawk": { "path": "~/Code/personal/squawk", "url": "https://github.com/gautham-v/squawk" },
+  "bridge": { "path": "~/Code/personal/firefox-agent-bridge", "url": "https://github.com/gautham-v/firefox-agent-bridge" },
+  "flashies": { "path": "~/Code/personal/flashies", "private": true },
+  "sidecar": { "path": "~/Code/personal/sidecar", "private": true }
+}

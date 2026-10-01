@@ -1,0 +1,910 @@
+diff --git a/README.md b/README.md
+index 5f74fb4..2a22af0 100644
+--- a/README.md
++++ b/README.md
+@@ -27,7 +27,7 @@ or `cargo install catcher`. Then run `catcher`.
+ - `#tags` are coloured, inline or as front matter `tags:`. **⌥⏎** or a click on one opens **^O** cut to the notes that carry it.
+ - A ` ```mermaid ` fence is drawn as text: flowcharts and sequence diagrams, in box-drawing characters, no images and no network. Other kinds keep their source under a label.
+ - Callouts, front matter, tables wider than the page (they pan sideways), checkboxes and `==highlights==` all render.
+-- Sections fold. On a heading, **⌥←** folds everything under it down to the next heading of the same or a higher level, **⌥→** opens it again; a folded heading shows `▸` and how many lines it hides. Folds are per note and last for the session; the reading view ignores them.
++- Sections fold. On a heading, **⌥←** folds everything under it down to the next heading of the same or a higher level, **⌥→** opens it again; a folded heading shows `▸` and how many lines it hides. Folds are per note and last for the session: they follow the note through a rename, a move and a reload from disk. The reading view shows them too, and a click on a heading there folds or unfolds it.
+ - Notes autosave. Edit a note in another program and catcher takes what is on disk: the buffer reloads, the cursor stays on its line, and **^Z** brings the old buffer back. A file deleted from under it is said so in the status bar and recreated on the next save.
+ - Mouse works: click, drag to select and copy, scroll. **^V** pastes a clipboard image as a PNG.
+ 
+diff --git a/src/app.rs b/src/app.rs
+index 016bc69..b0e50cf 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -224,7 +224,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+             ("↑ ↓  pgup pgdn", "scroll"),
+             ("← →", "pan a table too wide for the page"),
+             ("drag", "select text — it copies on release"),
+-            ("click", "a link opens it, a checkbox toggles it"),
++            (
++                "click",
++                "a link opens it, a checkbox toggles it, a heading folds",
++            ),
+             ("^P  esc  ⏎", "back to editing"),
+         ],
+     ),
+@@ -292,6 +295,9 @@ pub struct App {
+     /// every row's source line (for click → edit at the same place).
+     pub preview_links: Vec<(Rect, String)>,
+     pub preview_checkboxes: Vec<(Rect, usize)>,
++    /// The heading rows of the last preview draw that have a section to
++    /// fold, and the source line of each: a click on one folds or unfolds it.
++    pub preview_headings: Vec<(Rect, usize)>,
+     /// Every drawn row, its source line, and the cells it drew. The source
+     /// line is `None` for a row the renderer invented — a blank line between
+     /// paragraphs, a linked-mentions row — which can be selected and copied
+@@ -572,6 +578,7 @@ impl App {
+             palette_rows: Vec::new(),
+             preview_links: Vec::new(),
+             preview_checkboxes: Vec::new(),
++            preview_headings: Vec::new(),
+             preview_rows: Vec::new(),
+             dragging: false,
+             open_index: Vec::new(),
+@@ -631,6 +638,11 @@ impl App {
+         self.preview_hscroll = 0;
+         self.preview_goto = None;
+         self.preview_sel = None;
++        // the note may have been rewritten while another one was on screen —
++        // links retargeted after a rename, a newer copy read off the disk
++        let blocks = self.blocks();
++        self.folds
++            .settle(&self.notes[self.active].path, self.editor.lines(), &blocks);
+         self.refresh_visible();
+         self.sync_title();
+     }
+@@ -692,6 +704,30 @@ impl App {
+         }
+     }
+ 
++    /// A click on a heading in the reading view: close its section, or open
++    /// it again if it was closed. The folds are the editor's own, so the two
++    /// views always agree about what is shut.
++    fn toggle_fold(&mut self, row: usize) {
++        let path = self.notes[self.active].path.clone();
++        if !self.folds.unfold(&path, row) {
++            let blocks = self.blocks();
++            if self
++                .folds
++                .fold(&path, self.editor.lines(), &blocks, row)
++                .is_none()
++            {
++                self.flash("nothing under this heading".to_string());
++                return;
++            }
++        }
++        self.refresh_visible();
++        // the editor's cursor may be inside the section that just closed
++        let at = self.editor.cursor.0;
++        self.leave_folds(at);
++        // the rows under the pointer are about to be other rows
++        self.preview_sel = None;
++    }
++
+     fn fold_all(&mut self) {
+         let path = self.notes[self.active].path.clone();
+         let blocks = self.blocks();
+@@ -786,14 +822,28 @@ impl App {
+     }
+ 
+     fn sync_editor_to_note(&mut self) {
++        self.sync_note(None);
++    }
++
++    /// The buffer was swapped for another one — an undo, a redo — rather
++    /// than edited: `old` is what it held before, which is what says where
++    /// each folded heading went.
++    fn sync_swapped_buffer(&mut self, old: &[String]) {
++        self.sync_note(Some(old));
++    }
++
++    fn sync_note(&mut self, swapped: Option<&[String]>) {
+         let content = self.editor.text();
+         if content != self.notes[self.active].content {
+             self.notes[self.active].content = content;
+             self.dirty = true;
+             self.last_edit = Instant::now();
+             let blocks = self.blocks();
+-            self.folds
+-                .settle(&self.notes[self.active].path, self.editor.lines(), &blocks);
++            let path = &self.notes[self.active].path;
++            match swapped {
++                Some(old) => self.folds.carry(path, old, self.editor.lines(), &blocks),
++                None => self.folds.settle(path, self.editor.lines(), &blocks),
++            }
+             self.refresh_visible();
+             self.reveal_cursor();
+         }
+@@ -852,6 +902,7 @@ impl App {
+                 // just typed turn up in the footer of the note it names
+                 self.mentions.invalidate();
+                 if now != path {
++                    self.folds.rename(&path, &now);
+                     if let Some(done) = self.update_links(&path, &now) {
+                         self.flash(format!("renamed · {done}"));
+                     }
+@@ -929,7 +980,23 @@ impl App {
+             self.flash(format!("reload failed: {e}"));
+             return;
+         }
++        let old = self.editor.lines().to_vec();
+         self.editor.replace_all(&self.notes[self.active].content);
++        // the folds were made on the buffer that just went: each one follows
++        // its own heading into the new one, and the rows on screen are worked
++        // out again from there
++        let blocks = self.blocks();
++        self.folds.carry(
++            &self.notes[self.active].path,
++            &old,
++            self.editor.lines(),
++            &blocks,
++        );
++        self.refresh_visible();
++        // the cursor kept its line number, which may be inside a fold now
++        let at = self.editor.cursor.0;
++        self.leave_folds(at);
++        self.preview_sel = None;
+         self.dirty = false;
+         self.mentions.invalidate();
+         self.flash(if dropped {
+@@ -987,6 +1054,16 @@ impl App {
+     fn switch_to(&mut self, idx: usize) {
+         self.save_now();
+         self.active = idx;
++        // only the note on screen is watched, so one that sat in the session
++        // while another program wrote its file is behind the disk by now
++        if notes::check_disk(&self.notes[idx]) == notes::Disk::Changed {
++            let old: Vec<String> = self.notes[idx].content.lines().map(String::from).collect();
++            if notes::reload(&mut self.notes[idx]).is_ok() {
++                let new: Vec<String> = self.notes[idx].content.lines().map(String::from).collect();
++                let blocks = blocks_with(&new, self.config.front_matter);
++                self.folds.carry(&self.notes[idx].path, &old, &new, &blocks);
++            }
++        }
+         self.load_active_into_editor();
+         self.remember_active();
+     }
+@@ -1460,6 +1537,11 @@ impl App {
+         self.query.clear();
+         self.selected = 0;
+         self.tag_filter = None;
++        // the walk and the contents tab both read files, and what they say
++        // about the note on screen has to be what is on screen: a title, a
++        // filename that follows it, the line a hit is on
++        self.sync_editor_to_note();
++        self.save_now();
+         // before `enter_browse`, which reads the index it builds
+         self.refresh_index();
+         self.overlay = Overlay::QuickOpen;
+@@ -1509,8 +1591,26 @@ impl App {
+             return;
+         };
+         self.open_path(&path);
++        // the open can fail — the file went away since the walk — and the
++        // line means nothing in whichever note is still on screen
++        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
++        if canon(&self.active_note().path) != canon(&path) {
++            return;
++        }
++        // the hit was found in the body as the tab read it; the buffer is the
++        // file as it is now, and the line may have moved since
++        let wanted = self
++            .contents_bodies
++            .get(entry)
++            .and_then(|b| b.as_deref())
++            .and_then(|b| b.lines().nth(line));
++        let line = wanted.map_or(line, |w| nearest_line(self.editor.lines(), w, line));
++        self.editor.clear_selection();
+         self.editor.set_cursor((line, 0));
+-        self.preview_goto = Some(line);
++        // a hit inside a folded section opens the section: the line that was
++        // chosen has to be on screen, in the editor and on the page alike
++        self.reveal_cursor();
++        self.preview_goto = Some(self.editor.cursor.0);
+     }
+ 
+     /// Quick-open rows for the current query. With no query this is simply the
+@@ -1719,7 +1819,9 @@ impl App {
+             self.flash(format!("delete failed: {e}"));
+             return;
+         }
+-        self.notes.remove(self.active);
++        let gone = self.notes.remove(self.active);
++        // a note made later under the same name starts with nothing folded
++        self.folds.unfold_all(&gone.path);
+         self.dirty = false;
+         if self.notes.is_empty() {
+             match notes::create(&self.dir) {
+@@ -1880,8 +1982,10 @@ impl App {
+     /// if the folder already has one by that name); the title is untouched.
+     fn commit_move(&mut self, dir: &Path) {
+         let label = self.move_label(dir);
++        let old = self.active_note().path.clone();
+         match notes::move_file(&mut self.notes[self.active], dir) {
+             Ok(path) => {
++                self.folds.rename(&old, &path);
+                 let name = path
+                     .file_name()
+                     .map(|n| n.to_string_lossy().into_owned())
+@@ -1919,6 +2023,7 @@ impl App {
+         let old = self.active_note().path.clone();
+         match notes::rename_file(&mut self.notes[self.active], &stem) {
+             Ok(path) => {
++                self.folds.rename(&old, &path);
+                 let name = path
+                     .file_name()
+                     .map(|n| n.to_string_lossy().into_owned())
+@@ -2498,6 +2603,11 @@ impl App {
+             self.toggle_checkbox(row);
+             return;
+         }
++        if let Some((_, row)) = self.preview_headings.iter().find(|(r, _)| r.contains(at)) {
++            let row = *row;
++            self.toggle_fold(row);
++            return;
++        }
+         if self.config.preview_click == PreviewClick::Edit {
+             self.edit_at_preview(x, y);
+             return;
+@@ -2666,8 +2776,9 @@ impl App {
+     fn undo(&mut self) {
+         self.overlay = Overlay::None;
+         self.view = View::Edit;
++        let old = self.editor.lines().to_vec();
+         if self.editor.undo() {
+-            self.sync_editor_to_note();
++            self.sync_swapped_buffer(&old);
+         } else {
+             self.flash("nothing to undo".to_string());
+         }
+@@ -2676,8 +2787,9 @@ impl App {
+     fn redo(&mut self) {
+         self.overlay = Overlay::None;
+         self.view = View::Edit;
++        let old = self.editor.lines().to_vec();
+         if self.editor.redo() {
+-            self.sync_editor_to_note();
++            self.sync_swapped_buffer(&old);
+         } else {
+             self.flash("nothing to redo".to_string());
+         }
+@@ -3012,6 +3124,15 @@ fn view_line(
+     }
+ }
+ 
++/// The line of `lines` that reads `text`, nearest to `line` — `line` itself
++/// when it still does, or when no line does any more.
++fn nearest_line(lines: &[String], text: &str, line: usize) -> usize {
++    (0..lines.len())
++        .filter(|&r| lines[r] == text)
++        .min_by_key(|&r| r.abs_diff(line))
++        .unwrap_or(line)
++}
++
+ /// Does a fold key fold here, or fall through to the editor as the word
+ /// motion it also is? A heading takes it; a heading with shift held does not,
+ /// because ⇧⌥← is extending a selection and that is a motion anywhere.
+@@ -3660,6 +3781,16 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn a_search_hit_is_found_again_when_its_line_has_moved() {
++        let lines: Vec<String> = ["a", "x", "b", "x", "c"].map(String::from).to_vec();
++        assert_eq!(nearest_line(&lines, "b", 2), 2);
++        assert_eq!(nearest_line(&lines, "b", 0), 2);
++        // the nearest of several, and the line itself when nothing matches
++        assert_eq!(nearest_line(&lines, "x", 4), 3);
++        assert_eq!(nearest_line(&lines, "gone", 1), 1);
++    }
++
+     #[test]
+     fn a_folded_heading_carries_its_marker_and_still_maps_its_columns() {
+         let line = fold_marked(md::style_line("## Title"));
+diff --git a/src/config.rs b/src/config.rs
+index 9bdd706..f2834bb 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -277,21 +277,23 @@ impl Config {
+                 .ok()
+                 .and_then(|p| fs::read_to_string(p).ok())
+                 .unwrap_or_default();
+-            let migrated = Config::from_str(&seed);
+-            write_settings(&path, &migrated)?;
+-            return Ok(migrated);
++            // what is written is what the files said, never where the
++            // environment pointed this one run
++            write_settings(&path, &Config::from_file(&seed))?;
++            return Ok(Config::from_str(&seed));
+         }
+         let text =
+             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+-        let config = Config::from_str(&text);
+         // A settings file written by an older catcher is missing whatever has
+         // been added since, and a setting you cannot see is a setting you do
+         // not have. Rewriting is safe because the document is generated from
+-        // the config the file was just parsed into: every value survives.
+-        if !covers_every_setting(&text, &config) {
+-            let _ = write_settings(&path, &config);
++        // the config the file was just parsed into: every value survives —
++        // the file's own values, which is why `CATCHER_DIR` is left out of it.
++        let written = Config::from_file(&text);
++        if !covers_every_setting(&text, &written) {
++            let _ = write_settings(&path, &written);
+         }
+-        Ok(config)
++        Ok(Config::from_str(&text))
+     }
+ 
+     /// Push everything this config decides into the places that read it
+@@ -303,8 +305,23 @@ impl Config {
+         crate::md::tags::set_enabled(self.tags);
+     }
+ 
++    /// The settings as this session runs with them: what `text` says, with
++    /// the environment on top.
+     #[allow(clippy::should_implement_trait)]
+     pub fn from_str(text: &str) -> Config {
++        // the environment wins: it is how a one-off session is pointed elsewhere
++        let dir = std::env::var_os("CATCHER_DIR").or_else(|| std::env::var_os("TINYNOTE_DIR"));
++        Config::parse(text, dir.map(PathBuf::from))
++    }
++
++    /// The settings exactly as `text` has them, whatever the environment
++    /// says. This is the config a settings file is written back from: a
++    /// one-off `CATCHER_DIR` must never become the file's `notes_dir`.
++    pub fn from_file(text: &str) -> Config {
++        Config::parse(text, None)
++    }
++
++    fn parse(text: &str, dir: Option<PathBuf>) -> Config {
+         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+         let mut c = Config::default();
+ 
+@@ -312,11 +329,8 @@ impl Config {
+             c.notes_dir = expand(&v, &home);
+             c.attachments_dir = c.notes_dir.join("attachments");
+         }
+-        // the environment wins: it is how a one-off session is pointed elsewhere
+-        if let Some(d) =
+-            std::env::var_os("CATCHER_DIR").or_else(|| std::env::var_os("TINYNOTE_DIR"))
+-        {
+-            c.notes_dir = PathBuf::from(d);
++        if let Some(d) = dir {
++            c.notes_dir = d;
+             c.attachments_dir = c.notes_dir.join("attachments");
+         }
+         if let Some(v) = value(text, "attachments_dir") {
+@@ -1046,6 +1060,19 @@ mod tests {
+         assert!(!fresh.contains("A paragraph of prose"));
+     }
+ 
++    #[test]
++    fn the_config_a_settings_file_is_written_from_ignores_the_environment() {
++        // whatever CATCHER_DIR says for this run, the file keeps its own value
++        let c = Config::from_file("- notes_dir: /vault\n");
++        assert_eq!(c.notes_dir, PathBuf::from("/vault"));
++        assert_eq!(c.attachments_dir, PathBuf::from("/vault/attachments"));
++        assert!(c.to_document().contains("notes_dir: /vault"));
++        // and the override, when there is one, is only ever the session's
++        let s = Config::parse("- notes_dir: /vault\n", Some(PathBuf::from("/tmp/demo")));
++        assert_eq!(s.notes_dir, PathBuf::from("/tmp/demo"));
++        assert_eq!(s.attachments_dir, PathBuf::from("/tmp/demo/attachments"));
++    }
++
+     #[test]
+     fn a_current_settings_file_is_left_alone() {
+         let c = Config::default();
+diff --git a/src/fold.rs b/src/fold.rs
+index 3b6380d..a4d1049 100644
+--- a/src/fold.rs
++++ b/src/fold.rs
+@@ -158,6 +158,114 @@ impl Folds {
+             self.by_note.remove(path);
+         }
+     }
++
++    /// Bring the folds of `path` across a buffer that was swapped wholesale —
++    /// a reload after another program wrote the file, an undo back out of
++    /// one. `old` is the buffer the folds were made on and `lines` the one
++    /// that replaced it. A fold goes where its own heading line went, which
++    /// only the two buffers side by side can say: the text alone cannot tell
++    /// two `## Notes` apart, and the row alone is some other line by now. A
++    /// heading the rewrite changed or removed loses its fold, as in `settle`.
++    pub fn carry(&mut self, path: &Path, old: &[String], lines: &[String], blocks: &[Block]) {
++        let Some(m) = self.by_note.get_mut(path) else {
++            return;
++        };
++        let to = line_map(old, lines);
++        let once = |all: &[String], text: &String| {
++            let mut hits = (0..all.len()).filter(|&r| &all[r] == text);
++            hits.next().filter(|_| hits.next().is_none())
++        };
++        for (row, text) in std::mem::take(m) {
++            let at = to
++                .get(row)
++                .copied()
++                .flatten()
++                .filter(|&r| lines[r] == text)
++                // a section moved past its neighbours is still the same
++                // section, when there is only one line it can be
++                .or_else(|| once(old, &text).and_then(|_| once(lines, &text)));
++            if let Some(at) = at.filter(|&r| hidden_span(lines, blocks, r).is_some()) {
++                m.insert(at, text);
++            }
++        }
++        if m.is_empty() {
++            self.by_note.remove(path);
++        }
++    }
++
++    /// The note at `old` is at `new` now — renamed, or moved to another
++    /// folder. Its folds go with it: they belong to the note, not to what
++    /// its file happens to be called.
++    pub fn rename(&mut self, old: &Path, new: &Path) {
++        if old == new {
++            return;
++        }
++        match self.by_note.remove(old) {
++            Some(m) => {
++                self.by_note.insert(new.to_path_buf(), m);
++            }
++            // whatever was folded in a file that used to have this name
++            None => {
++                self.by_note.remove(new);
++            }
++        }
++    }
++}
++
++/// The most cells the line-matching table may take. Past it — two buffers
++/// that differ over thousands of lines each — nothing in the differing part
++/// is matched and the folds there fall back on their heading text.
++const MAP_LIMIT: usize = 4_000_000;
++
++/// Where each line of `old` is in `new`, or `None` for a line that is not
++/// there any more: the longest run of lines the two share, in order. The
++/// common head and tail are matched directly, so an edit in one place costs
++/// only the lines around it.
++fn line_map(old: &[String], new: &[String]) -> Vec<Option<usize>> {
++    let mut map = vec![None; old.len()];
++    let head = old.iter().zip(new).take_while(|(a, b)| a == b).count();
++    let tail = old[head..]
++        .iter()
++        .rev()
++        .zip(new[head..].iter().rev())
++        .take_while(|(a, b)| a == b)
++        .count();
++    for (i, slot) in map.iter_mut().enumerate().take(head) {
++        *slot = Some(i);
++    }
++    for k in 1..=tail {
++        map[old.len() - k] = Some(new.len() - k);
++    }
++    let a = &old[head..old.len() - tail];
++    let b = &new[head..new.len() - tail];
++    if a.is_empty() || b.is_empty() || a.len().saturating_mul(b.len()) > MAP_LIMIT {
++        return map;
++    }
++    // lcs[i][j]: the longest shared run of a[i..] and b[j..]
++    let w = b.len() + 1;
++    let mut lcs = vec![0u32; (a.len() + 1) * w];
++    for i in (0..a.len()).rev() {
++        for j in (0..b.len()).rev() {
++            lcs[i * w + j] = if a[i] == b[j] {
++                lcs[(i + 1) * w + j + 1] + 1
++            } else {
++                lcs[(i + 1) * w + j].max(lcs[i * w + j + 1])
++            };
++        }
++    }
++    let (mut i, mut j) = (0, 0);
++    while i < a.len() && j < b.len() {
++        if a[i] == b[j] {
++            map[head + i] = Some(head + j);
++            i += 1;
++            j += 1;
++        } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
++            i += 1;
++        } else {
++            j += 1;
++        }
++    }
++    map
+ }
+ 
+ /// Which buffer lines are on screen, and where. Built once per change and
+@@ -440,6 +548,58 @@ mod tests {
+         assert!(f.of(p).is_empty());
+     }
+ 
++    #[test]
++    fn a_rewritten_buffer_keeps_each_fold_on_the_heading_it_was_made_on() {
++        // two sections with the same heading text: only the second is folded
++        let l = lines("# A\n## Notes\na\n# B\n## Notes\nb\nc\n");
++        let b = md::blocks(&l);
++        let mut f = Folds::default();
++        let p = Path::new("n.md");
++        f.fold(p, &l, &b, 4);
++        // the rewrite puts a line under A, so the first Notes lands on row 2
++        // and the second on row 5 — and row 4 is still a heading, the wrong one
++        let l2 = lines("# A\nnew\n## Notes\na\n# B\n## Notes\nb\nc\n");
++        f.carry(p, &l, &l2, &md::blocks(&l2));
++        assert_eq!(f.of(p), vec![5]);
++        // three lines gone from the top: the folded heading is on the row
++        // the other one had
++        let l3 = lines("a\n# B\n## Notes\nb\nc\n");
++        f.carry(p, &l2, &l3, &md::blocks(&l3));
++        assert_eq!(f.of(p), vec![2]);
++        // a rewrite that takes the heading away takes the fold with it
++        let l4 = lines("a\n# B\nb\nc\n");
++        f.carry(p, &l3, &l4, &md::blocks(&l4));
++        assert!(f.of(p).is_empty());
++    }
++
++    #[test]
++    fn a_section_the_rewrite_moved_is_still_folded() {
++        let (l, b) = note();
++        let mut f = Folds::default();
++        let p = Path::new("n.md");
++        f.fold(p, &l, &b, 7);
++        f.fold(p, &l, &b, 2);
++        // Two and its line now come before One
++        let l2 = lines("# Title\nintro\n## Two\nd\n## One\na\nb\n### Deep\nc\n");
++        f.carry(p, &l, &l2, &md::blocks(&l2));
++        assert_eq!(f.of(p), vec![2, 4]);
++    }
++
++    #[test]
++    fn folds_follow_a_note_to_its_new_path() {
++        let (l, b) = note();
++        let mut f = Folds::default();
++        f.fold(Path::new("a.md"), &l, &b, 2);
++        f.fold(Path::new("b.md"), &l, &b, 7);
++        f.rename(Path::new("a.md"), Path::new("sub/c.md"));
++        assert!(f.of(Path::new("a.md")).is_empty());
++        assert_eq!(f.of(Path::new("sub/c.md")), vec![2]);
++        assert_eq!(f.of(Path::new("b.md")), vec![7]);
++        // renaming onto itself changes nothing
++        f.rename(Path::new("b.md"), Path::new("b.md"));
++        assert_eq!(f.of(Path::new("b.md")), vec![7]);
++    }
++
+     #[test]
+     fn the_scroll_counts_rows_on_screen_not_buffer_lines() {
+         let (l, b) = note();
+diff --git a/src/index.rs b/src/index.rs
+index 789ad1a..eb2bc61 100644
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -655,6 +655,8 @@ mod tests {
+             "---\ntags: work\n---\n# T #Work\n\n```\n#fenced\n```\nsee #home and `#code`\n",
+         );
+         assert_eq!(tags, vec!["work", "home"]);
++        // a link to one of the note's own headings is not a tag on it
++        assert!(tags_of("# Install\n\nsee [[#Setup]]\n\n## Setup\n").is_empty());
+     }
+ 
+     #[test]
+diff --git a/src/md.rs b/src/md.rs
+index 931078c..d3c5d5b 100644
+--- a/src/md.rs
++++ b/src/md.rs
+@@ -1194,11 +1194,15 @@ fn find_pair(src: &[char], from: usize, ch: char) -> Option<usize> {
+ /// opening one there. A tag is a `#` on a word boundary, then a letter, then
+ /// letters, digits, `-`, `_` or `/`. The boundary is what keeps `a#b` and a
+ /// URL fragment out; the letter is what keeps `#1`, `##` and a heading's
+-/// `# ` out.
++/// `# ` out. A `#` that opens a `[[#heading]]` link is the one boundary case
++/// that is not a tag: it names a heading of the note it is written in.
+ pub fn tag_at(src: &[char], i: usize) -> Option<usize> {
+     if src.get(i) != Some(&'#') || !tag_boundary(i.checked_sub(1).map(|k| src[k])) {
+         return None;
+     }
++    if i >= 2 && src[i - 1] == '[' && src[i - 2] == '[' {
++        return None;
++    }
+     if !src.get(i + 1).is_some_and(|c| c.is_alphabetic()) {
+         return None;
+     }
+@@ -1239,6 +1243,14 @@ pub fn tags_in(line: &str) -> Vec<(usize, usize)> {
+                 }
+             }
+             '[' => {
++                // a `[[wikilink]]` is drawn whole as a link, so a `#` in its
++                // label or after its target is part of the link, not a tag
++                if links::enabled() {
++                    if let Some(w) = wikilink_at(&src, i) {
++                        i = w.end;
++                        continue;
++                    }
++                }
+                 if let Some(close) = find(&src, i + 1, ']') {
+                     if src.get(close + 1) == Some(&'(') {
+                         if let Some(paren) = find(&src, close + 2, ')') {
+@@ -2728,6 +2740,18 @@ mod tests {
+         assert_eq!(tags_in("`x` #tag https://a.b#c"), vec![(4, 8)]);
+     }
+ 
++    #[test]
++    fn a_link_to_a_heading_of_the_same_note_is_not_a_tag() {
++        assert!(tags_in("see [[#Setup]] first").is_empty());
++        assert!(tags_in("[[#Setup|the setup section]]").is_empty());
++        // nor is a `#heading` after a note's name, or a `#` in a label
++        assert!(tags_in("[[guide#Setup]] and [[guide|see #setup]]").is_empty());
++        // a tag in single brackets, or beside a link, still is one
++        assert_eq!(tags_in("[#todo] [[#Setup]] #done"), vec![(1, 6), (19, 24)]);
++        tags::set_enabled(true);
++        assert_eq!(link_at("see [[#Setup]]", 7), None);
++    }
++
+     #[test]
+     fn a_tag_is_drawn_in_the_accent_and_kept_whole() {
+         tags::set_enabled(true);
+diff --git a/src/render.rs b/src/render.rs
+index 5399ad4..48ee09c 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -135,6 +135,62 @@ pub fn render_page_at(
+     r.finish()
+ }
+ 
++/// Close the folded sections of a rendered page, so the reading view shows a
++/// note the way the editor does: a line `hidden` says is under a fold is not
++/// on the page at all, and a heading `folded` says is closed gets the editor's
++/// `▸ ` in front of it. Both are asked by source line, counted from the top of
++/// the file.
++///
++/// A row with no source line of its own — the blank the renderer puts above a
++/// block, a rail-only row inside a quote — goes with the row after it, and at
++/// the very end of the page with the one before.
++pub fn fold_page(r: &mut Rendered, hidden: impl Fn(usize) -> bool, folded: impl Fn(usize) -> bool) {
++    let mut gone = vec![false; r.lines.len()];
++    let mut after: Option<bool> = None;
++    for (i, line) in r.lines.iter().enumerate().rev() {
++        match line.src_line {
++            Some(l) => {
++                gone[i] = hidden(l);
++                after = Some(gone[i]);
++            }
++            None => gone[i] = after.unwrap_or(false),
++        }
++    }
++    let mut before = false;
++    let mut tail = r.lines.len();
++    for (i, line) in r.lines.iter().enumerate() {
++        if line.src_line.is_some() {
++            before = gone[i];
++            tail = i + 1;
++        }
++    }
++    for g in &mut gone[tail..] {
++        *g = before;
++    }
++    let mut marked = None;
++    for (i, line) in r.lines.iter_mut().enumerate() {
++        let Some(l) = line.src_line.filter(|&l| !gone[i] && folded(l)) else {
++            continue;
++        };
++        // a heading long enough to have been wrapped is marked once
++        if marked == Some(l) {
++            continue;
++        }
++        marked = Some(l);
++        let marker = theme::FOLDED.chars().map(|ch| PCell {
++            ch,
++            style: theme::fold(),
++            link: None,
++            // the first `#`, as in the editor: a click on the marker that
++            // lands in the buffer lands at the start of the line
++            src: Some((l, 0)),
++        });
++        line.cells.splice(0..0, marker);
++    }
++    let mut gone = gone.into_iter();
++    r.lines.retain(|_| !gone.next().unwrap_or(false));
++}
++
+ /// Add the linked-mentions footer to an already-rendered page: a rule, a count,
+ /// and one row per note that links here.
+ ///
+@@ -721,7 +777,15 @@ impl Ren {
+                     0 => at(0).and_then(|o| self.src[..o].chars().next_back()),
+                     _ => Some(chars[i - 1]),
+                 };
+-                if crate::md::tag_boundary(prev) {
++                // and the same goes for the `[[` of a `[[#heading]]` link,
++                // which is not a tag and which pulldown hands over a bracket
++                // at a time
++                let before = |k: usize| match i.checked_sub(k) {
++                    Some(j) => Some(chars[j]),
++                    None => at(0).and_then(|o| self.src[..o].chars().rev().nth(k - i - 1)),
++                };
++                let heading_link = before(1) == Some('[') && before(2) == Some('[');
++                if crate::md::tag_boundary(prev) && !heading_link {
+                     if let Some(end) = crate::md::tag_at(&chars, i) {
+                         let name: String = chars[i + 1..end].iter().collect();
+                         self.push_at(&std::mem::take(&mut run), base, None, at(run_start));
+@@ -1975,6 +2039,39 @@ mod tests {
+         assert_eq!(done.cells[2].src, Some((5, 6)));
+     }
+ 
++    #[test]
++    fn a_folded_section_is_off_the_page_and_its_heading_is_marked() {
++        let md = "# Title\n\nintro\n\n## One\n\na\n\n```\ncode\n```\n\n## Two\n\nd\n";
++        let mut r = render(md);
++        // One (line 4) is folded: lines 5..=11 are under it
++        fold_page(&mut r, |l| (5..=11).contains(&l), |l| l == 4);
++        let text: Vec<String> = r.lines.iter().map(|l| l.text()).collect();
++        assert_eq!(
++            text,
++            vec!["Title", "", "intro", "", "\u{25b8} One", "", "Two", "", "d"]
++        );
++        let one = &r.lines[4];
++        assert_eq!(one.src_line, Some(4));
++        assert_eq!(one.cells[0].style, theme::fold());
++        // nothing folded leaves the page as it was rendered
++        let plain = render(md);
++        let mut same = plain.clone();
++        fold_page(&mut same, |_| false, |_| false);
++        assert_eq!(same.lines.len(), plain.lines.len());
++        // a fold that runs to the end of the note leaves no blank behind it
++        let mut r = render(md);
++        fold_page(&mut r, |l| l >= 13, |l| l == 12);
++        assert_eq!(r.lines.last().map(|l| l.text()), Some("\u{25b8} Two".to_string()));
++    }
++
++    #[test]
++    fn a_heading_link_is_not_a_tag_on_the_page() {
++        crate::md::tags::set_enabled(true);
++        let r = render("see [[#Setup]] and [[#Setup|here]] but #real\n");
++        let tags: Vec<&String> = r.urls.iter().filter(|u| u.starts_with("tag:")).collect();
++        assert_eq!(tags, vec!["tag:real"]);
++    }
++
+     #[test]
+     fn links_and_bare_urls_are_recorded() {
+         let r = render("see [docs](http://x.y) and https://z.example/p now");
+diff --git a/src/ui.rs b/src/ui.rs
+index 3f74bd3..8028102 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -255,6 +255,25 @@ struct Row {
+     src_line: Option<usize>,
+     /// A row of a scrolling table: never soft-wrapped, panned instead.
+     wide: bool,
++    /// The first row of a folded heading: what it says at its right edge.
++    fold: Option<String>,
++}
++
++/// The page row a source line is on: the row that drew it, or the block it is
++/// inside when it drew nothing of its own (a fence line, a table's rule), or
++/// failing both the first row after it. Every row of a code block or a table
++/// carries the block's first line as its source line, so the cells are asked
++/// first: they know the line each character came from.
++fn row_of_line(rows: &[Row], line: usize) -> Option<usize> {
++    let drew = |r: &Row| r.cells.iter().any(|c| c.src.is_some_and(|(l, _)| l == line));
++    rows.iter()
++        .position(drew)
++        .or_else(|| rows.iter().position(|r| r.src_line == Some(line)))
++        .or_else(|| {
++            let block = rows.iter().filter_map(|r| r.src_line).filter(|&l| l < line).max()?;
++            rows.iter().position(|r| r.src_line == Some(block))
++        })
++        .or_else(|| rows.iter().position(|r| r.src_line.is_some_and(|l| l > line)))
+ }
+ 
+ /// The rendered page: pre-wrapped so every row is exactly one screen line,
+@@ -270,6 +289,35 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+         .map_or((0, 0), |r| (r.end, content[..r.end].lines().count()));
+     let mut rendered =
+         crate::render::render_page_at(&content[skip..], first, width, app.config.table_style);
++    // the folds are the editor's: a section shut there is shut here, behind
++    // the same marker, and a click on its heading opens it
++    if !app.visible.is_plain() {
++        crate::render::fold_page(
++            &mut rendered,
++            |l| app.visible.is_hidden(l),
++            |l| app.folded_here(l),
++        );
++    }
++    let blocks = app.blocks();
++    let foldable = |l: usize| {
++        let lines = app.editor.lines();
++        crate::fold::heading_at(lines, &blocks, l).is_some()
++            && crate::fold::section_end(lines, &blocks, l) > l
++    };
++    // the heading lines a click can fold, and what the folded ones say
++    let headings: Vec<(usize, Option<String>)> = rendered
++        .lines
++        .iter()
++        .filter_map(|p| p.src_line)
++        .filter(|&l| foldable(l))
++        .map(|l| (l, app.fold_label(l)))
++        .collect();
++    let fold_label = |l: Option<usize>| {
++        headings
++            .iter()
++            .find(|(h, _)| Some(*h) == l)
++            .and_then(|(_, label)| label.clone())
++    };
+     // the footer arrives a frame or two late by design: the scan behind it
+     // reads every note body under the roots, and a page that waited for that
+     // would be a page that stuttered on every open
+@@ -301,6 +349,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+                         checkbox: None,
+                         src_line: pline.src_line,
+                         wide: false,
++                        fold: None,
+                     });
+                 }
+                 continue;
+@@ -313,15 +362,24 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+                 checkbox: pline.checkbox,
+                 src_line: pline.src_line,
+                 wide: true,
++                fold: None,
+             });
+             continue;
+         }
++        // only the first row a heading line put on the page says how much it
++        // hides, however many rows the heading wrapped to
++        let first_of_line = rows.last().map(|r| r.src_line) != Some(pline.src_line);
+         for (i, cells) in wrap_cells(&pline.cells, width).into_iter().enumerate() {
+             rows.push(Row {
+                 cells,
+                 checkbox: if i == 0 { pline.checkbox } else { None },
+                 src_line: pline.src_line,
+                 wide: false,
++                fold: if i == 0 && first_of_line {
++                    fold_label(pline.src_line)
++                } else {
++                    None
++                },
+             });
+         }
+     }
+@@ -344,10 +402,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+     // a line asked for by the contents tab: the first page row it wrapped to
+     // goes at the top, a couple of rows down so it is not flush with the edge
+     if let Some(line) = app.preview_goto.take() {
+-        if let Some(at) = rows
+-            .iter()
+-            .position(|r| r.src_line.is_some_and(|l| l >= line))
+-        {
++        if let Some(at) = row_of_line(&rows, line) {
+             app.preview_scroll = at.saturating_sub(2) as u16;
+         }
+     }
+@@ -356,6 +411,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+ 
+     app.preview_links.clear();
+     app.preview_checkboxes.clear();
++    app.preview_headings.clear();
+     app.preview_rows.clear();
+     app.preview_page_rows.clear();
+     let span = app.preview_span();
+@@ -401,9 +457,16 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+             }
+         }
+         app.preview_page_rows.push((page_row, rect, offset));
+-        lines.push(crate::render::to_line(&selected(
+-            &shown, page_row, offset, span,
+-        )));
++        let mut line = crate::render::to_line(&selected(&shown, page_row, offset, span));
++        if let Some(label) = &row.fold {
++            fold_note(&mut line, label, width);
++        }
++        lines.push(line);
++        if headings.iter().any(|(h, _)| Some(*h) == row.src_line) {
++            if let Some(src) = row.src_line {
++                app.preview_headings.push((rect, src));
++            }
++        }
+         // every drawn row is recorded, source line or not: a row the renderer
+         // invented — a blank line, a footer row — is still a row a selection
+         // can be dragged across, and one that is missing here silently kills

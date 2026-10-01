@@ -1,0 +1,10 @@
+# Tasks from repos that aren't public, with their runs. Their numbers are in results/*/scores.csv.
+private/
+# Build caches from `task.mjs warm`.
+.cache/
+# Raw transcripts and scheduler state.
+results/*/streams/
+results/*/logs/
+results/*/inflight/
+results/*/scheduler.lock
+.DS_Store

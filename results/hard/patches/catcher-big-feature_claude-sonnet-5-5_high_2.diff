@@ -1,0 +1,701 @@
+diff --git a/src/app.rs b/src/app.rs
+index c8e0cba..3c7df04 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -335,7 +335,8 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+             ("⌘A", "select all"),
+             ("⌥⌫", "delete the word before the cursor"),
+             ("⌘⌫", "delete to the start of the line"),
+-            ("tab", "indent (tab_width spaces)"),
++            ("tab", "indent (tab_width spaces); on a list item, nest it"),
++            ("⇧tab", "on a list item, bring it back out"),
+             (
+                 "tab / ⇧tab",
+                 "in a table: next / previous cell; past the last, a new row",
+diff --git a/src/editor.rs b/src/editor.rs
+index c3d3c6c..ff5312a 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -58,6 +58,9 @@ pub struct Editor {
+     batch: usize,
+     /// Spaces one `tab` inserts. Set from the settings; never zero.
+     pub tab_width: usize,
++    /// Set while list numbering is being settled after an edit, so a compound
++    /// edit built from other edits settles once, against its own start.
++    settling: bool,
+ }
+ 
+ /// Whether CRLF is the file's line ending: decided by majority, so a single
+@@ -320,6 +323,10 @@ impl Editor {
+     /// Swap the selected rows (or the cursor row) with the line beyond them,
+     /// carrying the cursor and the selection along. False at either edge.
+     pub fn move_selected_lines(&mut self, down: bool) -> bool {
++        self.settling(|e| e.move_selected_lines_raw(down))
++    }
++
++    fn move_selected_lines_raw(&mut self, down: bool) -> bool {
+         let (from, to) = self.selected_rows();
+         let can = if down {
+             to + 1 < self.lines.len()
+@@ -377,8 +384,10 @@ impl Editor {
+         if self.selection().is_none() {
+             return false;
+         }
+-        self.record(EditKind::Other);
+-        self.remove_selection()
++        self.settling(|e| {
++            e.record(EditKind::Other);
++            e.remove_selection()
++        })
+     }
+ 
+     /// The selection removal itself, without touching the undo history: the
+@@ -396,6 +405,15 @@ impl Editor {
+     }
+ 
+     pub fn insert_char(&mut self, c: char) {
++        // typing over a selection can take whole list items with it
++        if self.selection().is_some() {
++            self.settling(|e| e.insert_char_raw(c));
++        } else {
++            self.insert_char_raw(c);
++        }
++    }
++
++    fn insert_char_raw(&mut self, c: char) {
+         self.record(EditKind::Type);
+         // a run of word characters is one undo step; anything else ends it
+         if !c.is_alphanumeric() {
+@@ -409,6 +427,10 @@ impl Editor {
+ 
+     /// Insert arbitrary text at the cursor, newlines and all (a paste).
+     pub fn insert_str(&mut self, text: &str) {
++        self.settling(|e| e.insert_str_raw(text));
++    }
++
++    fn insert_str_raw(&mut self, text: &str) {
+         self.record(EditKind::Other);
+         self.batch += 1;
+         self.remove_selection();
+@@ -443,15 +465,25 @@ impl Editor {
+     /// so a double Enter ends the list. Anywhere but the end of a line this
+     /// is a plain newline.
+     pub fn insert_newline_continuing_list(&mut self) {
++        self.settling(|e| e.insert_newline_continuing_list_raw());
++    }
++
++    fn insert_newline_continuing_list_raw(&mut self) {
+         let (row, col) = self.cursor;
+         if self.anchor.is_some() || col != self.line_len(row) {
+             self.insert_newline();
+             return;
+         }
+-        let Some((prefix, body_empty)) = list_continuation(&self.lines[row]) else {
++        let Some((mut prefix, body_empty)) = list_continuation(&self.lines[row]) else {
+             self.insert_newline();
+             return;
+         };
++        // a list numbered alike on purpose goes on being numbered alike
++        if let Some(o) = ordered_item(&self.lines[row]) {
++            if numbered_alike(&self.lines, &list_items(&self.lines, row), &[]) {
++                prefix = format!("{}{}{} ", &self.lines[row][..o.ws], o.num, o.delim);
++            }
++        }
+         self.record(EditKind::Other);
+         self.batch += 1;
+         if body_empty {
+@@ -467,6 +499,215 @@ impl Editor {
+         self.last_kind = None;
+     }
+ 
++    /// Run an edit, then number the list it touched again: whatever the edit
++    /// inserted, removed, pasted or moved, the numbers follow.
++    fn settling<R>(&mut self, edit: impl FnOnce(&mut Self) -> R) -> R {
++        if self.settling {
++            return edit(self);
++        }
++        self.settling = true;
++        let pre = self.lines.clone();
++        let out = edit(self);
++        self.settling = false;
++        self.settle_lists(&pre);
++        out
++    }
++
++    /// Keep the cursor and anchor in step with `delta` chars added or removed
++    /// on `row`, for columns at or past `from`.
++    fn shift_cols(&mut self, row: usize, from: usize, delta: isize) {
++        for pos in [Some(&mut self.cursor), self.anchor.as_mut()]
++            .into_iter()
++            .flatten()
++        {
++            if pos.0 == row && pos.1 >= from {
++                pos.1 = (pos.1 as isize + delta).max(0) as usize;
++            }
++        }
++    }
++
++    fn renumbered(&mut self, row: usize, start: Option<u64>, fresh: &[usize]) {
++        for (r, delta, end_col) in renumber_list(&mut self.lines, row, start, fresh) {
++            self.shift_cols(r, end_col, delta);
++        }
++    }
++
++    /// After an edit that went from `pre` to the buffer as it is: when it
++    /// changed which ordered items there are, number the lists around the
++    /// change again. A list that lost its first item keeps counting from where
++    /// it began, so a moved or deleted `1.` does not turn the rest into `2.`.
++    fn settle_lists(&mut self, pre: &[String]) {
++        let n = self.lines.len();
++        let p = pre
++            .iter()
++            .zip(&self.lines)
++            .take_while(|(a, b)| a == b)
++            .count();
++        let s = pre[p..]
++            .iter()
++            .rev()
++            .zip(self.lines[p..].iter().rev())
++            .take_while(|(a, b)| a == b)
++            .count();
++        let (q_pre, q_post) = (pre.len() - s, n - s);
++        if ordered_markers(&pre[p..q_pre]) == ordered_markers(&self.lines[p..q_post]) {
++            return;
++        }
++        // lines that were not in the buffer before: typed or pasted in
++        let fresh: Vec<usize> = (p..q_post)
++            .filter(|&r| !pre.contains(&self.lines[r]))
++            .collect();
++        let mut done: Vec<usize> = Vec::new();
++        for r in p.saturating_sub(1)..=q_post.min(n - 1) {
++            let items = list_items(&self.lines, r);
++            let Some(&first) = items.first() else {
++                continue;
++            };
++            if done.contains(&first) {
++                continue;
++            }
++            done.push(first);
++            let start = if first < p {
++                None
++            } else if first < q_post {
++                // the list now begins inside the change: if it took over from a
++                // list whose first item was in it, carry that one's start
++                (p < q_pre)
++                    .then(|| list_items(pre, p))
++                    .and_then(|old| match old.first() {
++                        Some(&f) if f == p => ordered_item(&pre[f]).map(|o| o.num),
++                        _ => None,
++                    })
++            } else {
++                // it begins just past the change, so it was cut off from the
++                // top of a list that did: count on from where that one began
++                let old = first + q_pre - q_post;
++                list_items(pre, old)
++                    .first()
++                    .and_then(|&f| ordered_item(&pre[f]))
++                    .map(|o| o.num)
++            };
++            self.renumbered(first, start, &fresh);
++        }
++    }
++
++    /// Tab / Shift+Tab on a list item: nest it under the item above, or bring
++    /// it back out one level, taking what is nested under it along. With a
++    /// selection every selected item moves together. `None` when no selected
++    /// row is a list item; `Some(false)` when there is nowhere to go (the first
++    /// item of a list cannot nest, a top-level one cannot come out).
++    fn indent_list(&mut self, deeper: bool) -> Option<bool> {
++        let (from, to) = self.selected_rows();
++        let lead = (from..=to).find(|&r| item_marker_len(&self.lines[r]).is_some())?;
++        let w = indent_width(&self.lines[lead]);
++        let tabbed = |l: &str| l.starts_with('\t');
++        let (cols, tab) = if deeper {
++            let mut prev = None;
++            for k in (0..lead).rev() {
++                let line = &self.lines[k];
++                if is_blank(line) || indent_width(line) > w {
++                    continue;
++                }
++                if indent_width(line) == w && item_marker_len(line).is_some() {
++                    prev = Some(k);
++                }
++                break;
++            }
++            let Some(prev) = prev else {
++                return Some(false);
++            };
++            let tab = tabbed(&self.lines[lead]) || tabbed(&self.lines[prev]);
++            let child = self.lines[prev + 1..lead]
++                .iter()
++                .find(|l| !is_blank(l))
++                .filter(|l| indent_width(l) > w && item_marker_len(l).is_some())
++                .map(|l| indent_width(l) - w);
++            let own = item_marker_len(&self.lines[prev]).unwrap_or(2)
++                - (self.lines[prev].len() - self.lines[prev].trim_start().len());
++            let cols = if tab {
++                4
++            } else {
++                child.unwrap_or(self.tab_width.max(1).max(own))
++            };
++            (cols, tab)
++        } else {
++            if w == 0 {
++                return Some(false);
++            }
++            let parent = (0..lead)
++                .rev()
++                .map(|k| &self.lines[k])
++                .find(|l| !is_blank(l) && indent_width(l) < w)
++                .filter(|l| item_marker_len(l).is_some())
++                .map(|l| indent_width(l));
++            (
++                parent.map_or(w.min(self.tab_width.max(1)), |pw| w - pw),
++                false,
++            )
++        };
++        let end = (from..=to)
++            .filter(|&r| item_marker_len(&self.lines[r]).is_some())
++            .map(|r| subtree_end(&self.lines, r))
++            .fold(to, usize::max);
++        let moved = from..=end;
++        let items: Vec<usize> = (from..=to)
++            .filter(|&r| ordered_item(&self.lines[r]).is_some())
++            .collect();
++        // the lists that lose members to the move, and where they began
++        let mut left_behind: Vec<(usize, u64)> = Vec::new();
++        let mut seen: Vec<usize> = Vec::new();
++        for r in moved.clone() {
++            let list = list_items(&self.lines, r);
++            let Some(&first) = list.first() else {
++                continue;
++            };
++            if seen.contains(&first) {
++                continue;
++            }
++            seen.push(first);
++            let num = ordered_item(&self.lines[first]).map_or(1, |o| o.num);
++            left_behind.extend(
++                list.iter()
++                    .filter(|m| !moved.contains(m))
++                    .map(|&m| (m, num)),
++            );
++        }
++
++        self.record(EditKind::Other);
++        self.last_kind = None;
++        for r in moved {
++            if is_blank(&self.lines[r]) {
++                continue;
++            }
++            let delta = if deeper {
++                let add = if tab {
++                    "\t".to_string()
++                } else {
++                    " ".repeat(cols)
++                };
++                self.lines[r].insert_str(0, &add);
++                add.chars().count() as isize
++            } else {
++                let (rest, removed) = dedent(&self.lines[r], cols);
++                self.lines[r] = rest;
++                -(removed as isize)
++            };
++            self.shift_cols(r, 0, delta);
++        }
++        for (m, start) in left_behind {
++            self.renumbered(m, Some(start), &items);
++        }
++        for &r in &items {
++            let first = list_items(&self.lines, r).first().copied();
++            let start = first.filter(|f| items.contains(f)).map(|_| 1);
++            self.renumbered(r, start, &items);
++        }
++        self.cursor = self.clamp(self.cursor);
++        self.anchor = self.anchor.map(|a| self.clamp(a));
++        self.follow_cursor = true;
++        Some(true)
++    }
++
+     /// Char range of the cluster the char at `col` belongs to, when that
+     /// cluster is a ZWJ sequence or a flag; `col..col + 1` otherwise.
+     fn cluster_at(&self, row: usize, col: usize) -> (usize, usize) {
+@@ -481,6 +722,10 @@ impl Editor {
+     }
+ 
+     pub fn backspace(&mut self) {
++        self.settling(|e| e.backspace_raw());
++    }
++
++    fn backspace_raw(&mut self) {
+         self.record(EditKind::Delete);
+         if self.remove_selection() {
+             return;
+@@ -499,6 +744,10 @@ impl Editor {
+     }
+ 
+     pub fn delete_forward(&mut self) {
++        self.settling(|e| e.delete_forward_raw());
++    }
++
++    fn delete_forward_raw(&mut self) {
+         self.record(EditKind::Delete);
+         if self.remove_selection() {
+             return;
+@@ -539,10 +788,12 @@ impl Editor {
+     /// On an already-empty prefix this joins with the previous line, like a
+     /// plain backspace, so the key is never a no-op mid-buffer.
+     pub fn delete_to_line_start(&mut self) {
+-        self.record(EditKind::Other);
+-        self.batch += 1;
+-        self.kill_to_line_start();
+-        self.batch -= 1;
++        self.settling(|e| {
++            e.record(EditKind::Other);
++            e.batch += 1;
++            e.kill_to_line_start();
++            e.batch -= 1;
++        });
+     }
+ 
+     fn kill_to_line_start(&mut self) {
+@@ -562,10 +813,12 @@ impl Editor {
+ 
+     /// Delete the word before the cursor (Option+Backspace).
+     pub fn delete_prev_word(&mut self) {
+-        self.record(EditKind::Delete);
+-        self.batch += 1;
+-        self.kill_prev_word();
+-        self.batch -= 1;
++        self.settling(|e| {
++            e.record(EditKind::Delete);
++            e.batch += 1;
++            e.kill_prev_word();
++            e.batch -= 1;
++        });
+     }
+ 
+     fn kill_prev_word(&mut self) {
+@@ -640,7 +893,13 @@ impl Editor {
+                 self.delete_forward();
+                 return true;
+             }
++            KeyCode::BackTab => return self.indent_list(false).unwrap_or(false),
++            KeyCode::Tab if select => return self.indent_list(false).unwrap_or(false),
+             KeyCode::Tab => {
++                // in a list, nest the item; anywhere else, spaces
++                if let Some(changed) = self.indent_list(true) {
++                    return changed;
++                }
+                 for _ in 0..self.tab_width.max(1) {
+                     self.insert_char(' ');
+                 }
+@@ -826,6 +1085,188 @@ fn list_continuation(line: &str) -> Option<(String, bool)> {
+     Some((format!("{indent}{marker}"), body.trim().is_empty()))
+ }
+ 
++/// An ordered list marker at the start of a line: `3. ` or `3) `, indent first.
++struct Ordered {
++    /// Bytes of leading whitespace.
++    ws: usize,
++    /// Digits in the number.
++    digits: usize,
++    num: u64,
++    delim: char,
++}
++
++fn ordered_item(line: &str) -> Option<Ordered> {
++    let ws = line.len() - line.trim_start_matches([' ', '\t']).len();
++    let rest = &line[ws..];
++    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
++    if digits == 0 || digits > 9 {
++        return None;
++    }
++    let after = &rest[digits..];
++    let delim = after.chars().next().filter(|c| matches!(c, '.' | ')'))?;
++    after[1..].strip_prefix(' ')?;
++    Some(Ordered {
++        ws,
++        digits,
++        num: rest[..digits].parse().ok()?,
++        delim,
++    })
++}
++
++/// Bytes from the start of `line` to the text of its list item, if it is one.
++fn item_marker_len(line: &str) -> Option<usize> {
++    if let Some(o) = ordered_item(line) {
++        return Some(o.ws + o.digits + 2);
++    }
++    let ws = line.len() - line.trim_start_matches([' ', '\t']).len();
++    let rest = &line[ws..];
++    (rest.starts_with(['-', '*', '+']) && rest[1..].starts_with(' ')).then_some(ws + 2)
++}
++
++fn is_blank(line: &str) -> bool {
++    line.trim().is_empty()
++}
++
++/// Display columns of leading whitespace; a tab counts four.
++fn indent_width(line: &str) -> usize {
++    line.chars()
++        .take_while(|c| matches!(c, ' ' | '\t'))
++        .map(|c| if c == '\t' { 4 } else { 1 })
++        .sum()
++}
++
++/// The next (or previous) item of the list the ordered item at `from` is in:
++/// same indent, same delimiter. Deeper lines and blank lines in between belong
++/// to the item; anything else at its indent, or shallower, ends the list.
++fn sibling(lines: &[String], from: usize, down: bool) -> Option<usize> {
++    let me = ordered_item(&lines[from])?;
++    let w = indent_width(&lines[from]);
++    let mut k = from;
++    loop {
++        k = if down { k + 1 } else { k.checked_sub(1)? };
++        let line = lines.get(k)?;
++        if is_blank(line) {
++            continue;
++        }
++        let lw = indent_width(line);
++        if lw > w {
++            continue;
++        }
++        if lw < w {
++            return None;
++        }
++        return ordered_item(line)
++            .filter(|o| o.delim == me.delim)
++            .map(|_| k);
++    }
++}
++
++/// The rows of the list the ordered item at `row` belongs to, top to bottom.
++fn list_items(lines: &[String], row: usize) -> Vec<usize> {
++    if lines.get(row).and_then(|l| ordered_item(l)).is_none() {
++        return Vec::new();
++    }
++    let mut first = row;
++    while let Some(up) = sibling(lines, first, false) {
++        first = up;
++    }
++    let mut items = vec![first];
++    while let Some(next) = sibling(lines, *items.last().unwrap(), true) {
++        items.push(next);
++    }
++    items
++}
++
++/// Whether a list numbers every item alike (`1.` `1.` `1.`), on purpose. The
++/// rows in `fresh` are the ones just inserted or moved in: their numbers say
++/// nothing about how the list was meant to be numbered.
++fn numbered_alike(lines: &[String], items: &[usize], fresh: &[usize]) -> bool {
++    let nums: Vec<u64> = items
++        .iter()
++        .filter(|r| !fresh.contains(r))
++        .filter_map(|&r| ordered_item(&lines[r]).map(|o| o.num))
++        .collect();
++    nums.len() >= 2 && nums.iter().all(|n| *n == nums[0])
++}
++
++/// Number the list the item at `row` is in one, two, three… from `start` (its
++/// own first number when `None`). A list that numbers every item alike is
++/// left as it is. Returns `(row, change in marker length, char column where the
++/// number ended)` for each line rewritten.
++fn renumber_list(
++    lines: &mut [String],
++    row: usize,
++    start: Option<u64>,
++    fresh: &[usize],
++) -> Vec<(usize, isize, usize)> {
++    let items = list_items(lines, row);
++    if items.is_empty() || numbered_alike(lines, &items, fresh) {
++        return Vec::new();
++    }
++    let first = ordered_item(&lines[items[0]]).map_or(1, |o| o.num);
++    let start = start.unwrap_or(first);
++    let mut changes = Vec::new();
++    for (k, &r) in items.iter().enumerate() {
++        let Some(o) = ordered_item(&lines[r]) else {
++            continue;
++        };
++        let want = start + k as u64;
++        if want == o.num {
++            continue;
++        }
++        let from = o.ws;
++        let to = o.ws + o.digits;
++        let end_col = lines[r][..to].chars().count();
++        let new = want.to_string();
++        let delta = new.len() as isize - o.digits as isize;
++        lines[r].replace_range(from..to, &new);
++        changes.push((r, delta, end_col));
++    }
++    changes
++}
++
++/// The ordered markers on `lines`, as (indent, number, delimiter).
++fn ordered_markers(lines: &[String]) -> Vec<(usize, u64, char)> {
++    lines
++        .iter()
++        .filter_map(|l| ordered_item(l).map(|o| (indent_width(l), o.num, o.delim)))
++        .collect()
++}
++
++/// The last row of the item at `row`: itself and every deeper line under it.
++fn subtree_end(lines: &[String], row: usize) -> usize {
++    let w = indent_width(&lines[row]);
++    let mut end = row;
++    for (k, line) in lines.iter().enumerate().skip(row + 1) {
++        if is_blank(line) {
++            continue;
++        }
++        if indent_width(line) <= w {
++            break;
++        }
++        end = k;
++    }
++    end
++}
++
++/// Take `cols` columns of leading whitespace off `line`.
++fn dedent(line: &str, cols: usize) -> (String, usize) {
++    let mut left = cols;
++    let mut removed = 0;
++    let mut chars = line.chars().peekable();
++    while left > 0 {
++        let step = match chars.peek() {
++            Some(' ') => 1,
++            Some('\t') => 4,
++            _ => break,
++        };
++        chars.next();
++        removed += 1;
++        left = left.saturating_sub(step);
++    }
++    (chars.collect(), removed)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1341,4 +1782,119 @@ mod tests {
+         e.backspace();
+         assert_eq!(e.text(), "caf");
+     }
++
++    fn at(text: &str, row: usize, col: usize) -> Editor {
++        let mut e = Editor::new(text);
++        e.set_cursor((row, col));
++        e
++    }
++
++    fn tab(e: &mut Editor, back: bool) -> bool {
++        if back {
++            e.on_key(key(KeyCode::BackTab, KeyModifiers::SHIFT))
++        } else {
++            e.on_key(key(KeyCode::Tab, KeyModifiers::NONE))
++        }
++    }
++
++    #[test]
++    fn a_paste_under_a_list_carries_on_its_numbers() {
++        let mut e = at("6. a\n7. b\n\n", 2, 0);
++        e.insert_str("1. c\n2. d\n3. e");
++        assert_eq!(e.text(), "6. a\n7. b\n8. c\n9. d\n10. e\n");
++        assert_eq!(e.cursor, (4, 5));
++        assert!(e.undo());
++        assert_eq!(e.text(), "6. a\n7. b\n\n");
++    }
++
++    #[test]
++    fn enter_deleting_and_moving_keep_the_numbers_right() {
++        let mut e = at("1. a\n2. b\n3. c", 0, 4);
++        e.insert_newline_continuing_list();
++        assert_eq!(e.text(), "1. a\n2. \n3. b\n4. c");
++        assert_eq!(e.cursor, (1, 3));
++        // delete the middle item whole
++        let mut e = at("1. a\n2. b\n3. c", 1, 0);
++        e.anchor = Some((2, 0));
++        e.delete_selection();
++        assert_eq!(e.text(), "1. a\n2. c");
++        // delete the first
++        let mut e = at("1. a\n2. b\n3. c", 0, 0);
++        e.anchor = Some((1, 0));
++        e.delete_selection();
++        assert_eq!(e.text(), "1. b\n2. c");
++        // moves
++        let mut e = at("1. a\n2. b\n3. c", 2, 0);
++        assert!(e.move_selected_lines(false));
++        assert_eq!(e.text(), "1. a\n2. c\n3. b");
++        assert!(e.move_selected_lines(false));
++        assert_eq!(e.text(), "1. c\n2. a\n3. b");
++        assert!(e.undo());
++        assert_eq!(e.text(), "1. a\n2. c\n3. b");
++    }
++
++    #[test]
++    fn lists_numbered_alike_and_other_lists_are_left_alone() {
++        let mut e = at("1. a\n1. b\n1. c", 0, 4);
++        e.insert_newline_continuing_list();
++        assert_eq!(e.text(), "1. a\n1. \n1. b\n1. c");
++        let mut e = at("1. a\n1. b\n1. c", 1, 0);
++        e.anchor = Some((2, 0));
++        e.delete_selection();
++        assert_eq!(e.text(), "1. a\n1. c");
++        let text = "1. a\n3. b\n\ntext\n\n5. x\n9. y\n\n- 4. z";
++        let mut e = at(text, 0, 4);
++        e.insert_newline_continuing_list();
++        assert_eq!(e.text(), "1. a\n2. \n3. b\n\ntext\n\n5. x\n9. y\n\n- 4. z");
++    }
++
++    #[test]
++    fn numbers_follow_only_their_own_level() {
++        let mut e = at("1. a\n   1. x\n   2. y\n2. b\n3. c", 3, 0);
++        e.anchor = Some((4, 0));
++        e.delete_selection();
++        assert_eq!(e.text(), "1. a\n   1. x\n   2. y\n2. c");
++        let mut e = at("1. a\n   1. x\n   2. y\n2. b", 1, 7);
++        e.insert_newline_continuing_list();
++        assert_eq!(e.text(), "1. a\n   1. x\n   2. \n   3. y\n2. b");
++    }
++
++    #[test]
++    fn tab_nests_an_item_under_the_one_above_with_its_children() {
++        let mut e = at("1. a\n2. b\n   - x\n3. c", 1, 3);
++        assert!(tab(&mut e, false));
++        assert_eq!(e.text(), "1. a\n   1. b\n      - x\n2. c");
++        assert_eq!(e.cursor, (1, 6));
++        assert!(tab(&mut e, true));
++        assert_eq!(e.text(), "1. a\n2. b\n   - x\n3. c");
++        assert_eq!(e.cursor, (1, 3));
++        // joins an existing child list
++        let mut e = at("1. a\n   1. x\n2. b\n3. c", 2, 0);
++        tab(&mut e, false);
++        assert_eq!(e.text(), "1. a\n   1. x\n   2. b\n2. c");
++        // the first item cannot nest; a non-list line still gets spaces
++        let mut e = at("1. a\n2. b", 0, 0);
++        assert!(!tab(&mut e, false));
++        assert_eq!(e.text(), "1. a\n2. b");
++        let mut e = at("plain", 0, 0);
++        tab(&mut e, false);
++        assert_eq!(e.text(), "  plain");
++    }
++
++    #[test]
++    fn shift_tab_hands_the_following_siblings_a_fresh_count() {
++        let mut e = at("1. a\n   1. b\n   2. c\n   3. d\n2. e", 2, 5);
++        assert!(tab(&mut e, true));
++        assert_eq!(e.text(), "1. a\n   1. b\n2. c\n   1. d\n3. e");
++        assert!(!tab(&mut e, true) || e.text().starts_with("1. a"));
++    }
++
++    #[test]
++    fn tab_on_a_selection_nests_every_selected_item() {
++        let mut e = at("1. a\n2. b\n3. c\n4. d", 1, 0);
++        e.anchor = Some((1, 0));
++        e.cursor = (2, 4);
++        assert!(tab(&mut e, false));
++        assert_eq!(e.text(), "1. a\n   1. b\n   2. c\n2. d");
++    }
+ }

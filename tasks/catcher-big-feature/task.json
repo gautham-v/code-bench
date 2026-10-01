@@ -1,0 +1,82 @@
+{
+  "id": "catcher-big-feature",
+  "set": "hard",
+  "repo": "catcher",
+  "base": "20e459ffeec2b488a0d8811070e1cad811b2e0cb",
+  "fix": "d3356b07ca8644a3b4bca3df6577e412bf874ac0",
+  "kind": "feature",
+  "prompt": "Numbered lists are a chore in the editor. I copied five items off the top of one note and pasted them under the seven in another, and the file now reads 6. 7. 1. 2. 3., so I had to fix every number by hand. Same when I press Enter in the middle of a list, delete an item, or move a line up or down: the numbers below are left wrong. And Tab on an item just drops spaces at the cursor. I want it to nest the item under the one above, the way Obsidian does, with Shift+Tab bringing it back out. Whatever is already nested under the item goes along with it, and the numbers should follow there too. Only the list I'm editing should change. Some of my notes number every item 1. on purpose; leave those lists as they are.",
+  "clone": [],
+  "env": {
+    "CARGO_TARGET_DIR": "{root}/target",
+    "CARGO_NET_OFFLINE": "true"
+  },
+  "warm": "cargo test --no-run",
+  "protected": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/testutil.rs"
+  ],
+  "checks": [
+    {
+      "name": "existing_tests_pass",
+      "cmd": "bash heldout/run.sh existing",
+      "expect_base": "pass",
+      "timeout_s": 900
+    },
+    {
+      "name": "plain_editing_unchanged",
+      "cmd": "bash heldout/run.sh plain",
+      "expect_base": "pass",
+      "timeout_s": 900
+    },
+    {
+      "name": "same_number_lists_left_alone",
+      "cmd": "bash heldout/run.sh all_ones",
+      "expect_base": "pass",
+      "timeout_s": 900
+    },
+    {
+      "name": "paste_joins_count",
+      "cmd": "bash heldout/run.sh paste_count",
+      "expect_base": "fail",
+      "timeout_s": 900
+    },
+    {
+      "name": "nested_lists_count_separately",
+      "cmd": "bash heldout/run.sh nested",
+      "expect_base": "fail",
+      "timeout_s": 900
+    },
+    {
+      "name": "code_and_other_lists_untouched",
+      "cmd": "bash heldout/run.sh elsewhere",
+      "expect_base": "fail",
+      "timeout_s": 900
+    },
+    {
+      "name": "enter_delete_move_recount",
+      "cmd": "bash heldout/run.sh edits",
+      "expect_base": "fail",
+      "timeout_s": 900
+    },
+    {
+      "name": "tab_nests_shift_tab_unnests",
+      "cmd": "bash heldout/run.sh nesting",
+      "expect_base": "fail",
+      "timeout_s": 900
+    },
+    {
+      "name": "edit_is_one_undo_step",
+      "cmd": "bash heldout/run.sh undo_step",
+      "expect_base": "fail",
+      "timeout_s": 900
+    },
+    {
+      "name": "cursor_stays_on_its_text",
+      "cmd": "bash heldout/run.sh cursor",
+      "expect_base": "fail",
+      "timeout_s": 900
+    }
+  ]
+}

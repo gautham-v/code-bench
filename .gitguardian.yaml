@@ -1,0 +1,7 @@
+version: 2
+secret:
+  # Held-out tests and run diffs copy the source repos' test fixtures, whose passwords and tokens
+  # are dummies.
+  ignored_paths:
+    - "tasks/*/hidden/**"
+    - "results/*/patches/**"

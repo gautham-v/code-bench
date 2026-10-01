@@ -1,0 +1,1086 @@
+diff --git a/README.md b/README.md
+index dc3879f..5ab97a9 100644
+--- a/README.md
++++ b/README.md
+@@ -27,6 +27,7 @@ or `cargo install catcher`. Then run `catcher`.
+ - **⌥D** opens today's note, `journal/2026-09-01.md`, made from `journal/template.md` the first time (`{{title}}`, `{{date}}`, `{{date:FMT}}`, `{{time}}`, `{{yesterday}}`, `{{tomorrow}}`) and never rewritten after. `daily_format` names the file with Obsidian's tokens (`YYYY`, `MM`, `DD`, `MMMM`, `ddd`, `Do`, `HH`, `mm`, `A`, `[literal]`); a `/` in it is a subfolder.
+ - **Insert template** in the palette (unbound, `key_template`) puts a template in at the cursor as one undo step: the `.md` files under `templates_dir` (`templates`, or the folder a vault's `.obsidian/templates.json` names), one a row by name, **⏎** picks and **Esc** leaves the note as it was. The daily note's placeholders fill in, `{{title}}` being the note you are in. **New from template** makes a note out of one instead. **Set templates folder…** in the palette lists every folder in the vault and writes the one you pick to `templates_dir`, live. A template is an ordinary note: it still shows in **^O**.
+ - Typing `[[` suggests notes, `[[note#` its headings, `[[^` this note's paragraphs and list items and `[[note#^` another's (a block without an id gets one written onto it, Obsidian's way), and `#` the vault's tags; **⏎** or **Tab** takes one, **Esc** dismisses. `autocomplete: no` turns it off.
++- Numbered lists keep their numbers: paste, ⏎ in the middle of a list, delete or move an item, and the items below are renumbered, nested lists included. A list counts on from the number it starts at, and one that numbers every item `1.` is left as it is. **Tab** on an item nests it under the one above, with whatever is nested in it; **⇧Tab** brings it back out.
+ - The palette also has editing commands, unbound until you give them a key: toggle checkbox (`- item` → `- [ ]` → `- [x]` → `- item`, numbered lists too), move line up / down, toggle heading (`#`, `##`, `###`, none), insert today's date, copy path, reveal in Finder. Each takes the selection when there is one, and undoes as one step.
+ - **^P** flips between the live-preview editor and the rendered page. Images draw inline in Ghostty, kitty and iTerm2, whether written `![alt](path)` or as an Obsidian embed, `![[path]]`, `![[path|alt]]` or `![[path|300]]` for a width in pixels. A picture or attachment is looked for beside the note, in its attachments folder, in `attachments_dir`, then anywhere in the vault by name; a vault's `.obsidian/app.json` sets the attachments folder when the settings do not, and **Set attachments folder…** in the palette picks one out of the vault and writes it to `attachments_dir`. A folder either names is only taken if it is there; the default stands when it is not. In the reading view a click on a picture takes the whole terminal with it; **←** / **→** step between the note's pictures, and any other key or a click puts the page back.
+ - The editor renders as you type. `**bold**`, `*italic*`, `` `code` ``, `==highlight==`, `[[link]]` and `[text](url)` are drawn on the keystroke that closes them; a `#tag` colours on its first letter and a heading on its `# `. A span shows its markup again only while the cursor is inside it, so the rest of the line stays rendered while you edit one word of it, and a selection reveals whatever it covers. What replaces a line rather than decorating it — an image, an embed, a rule, a table, a fence, `$$maths$$`, front matter — still shows its source until the cursor leaves it, since there is nowhere in the drawn form for a cursor to stand.
+diff --git a/src/editor.rs b/src/editor.rs
+index c3d3c6c..9ce263f 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -58,6 +58,9 @@ pub struct Editor {
+     batch: usize,
+     /// Spaces one `tab` inserts. Set from the settings; never zero.
+     pub tab_width: usize,
++    /// Non-zero while a tracked edit is running; only the outermost one
++    /// renumbers the lists it touched.
++    tracking: usize,
+ }
+ 
+ /// Whether CRLF is the file's line ending: decided by majority, so a single
+@@ -164,6 +167,37 @@ impl Editor {
+         true
+     }
+ 
++    /// Run an edit, then put the numbers of the ordered lists it touched back
++    /// in order. Edits that call each other renumber once, at the end of the
++    /// outermost.
++    fn tracked<R>(&mut self, edit: impl FnOnce(&mut Editor) -> R) -> R {
++        if self.tracking > 0 {
++            return edit(self);
++        }
++        let before = self.lines.clone();
++        self.tracking += 1;
++        let out = edit(self);
++        self.tracking -= 1;
++        let shifts = crate::listnum::renumber_after(&before, &mut self.lines);
++        self.follow_shifts(&shifts);
++        out
++    }
++
++    /// Keep the cursor and the anchor at the same place in their lines when
++    /// the start of a line was rewritten under them.
++    fn follow_shifts(&mut self, shifts: &[crate::listnum::Shift]) {
++        for s in shifts {
++            if self.cursor.0 == s.row {
++                self.cursor.1 = s.apply(self.cursor.1);
++            }
++            if let Some(a) = self.anchor.as_mut().filter(|a| a.0 == s.row) {
++                a.1 = s.apply(a.1);
++            }
++        }
++        self.cursor = self.clamp(self.cursor);
++        self.anchor = self.anchor.map(|a| self.clamp(a));
++    }
++
+     pub fn select_all(&mut self) {
+         self.anchor = Some((0, 0));
+         self.cursor = self.doc_end();
+@@ -306,20 +340,26 @@ impl Editor {
+     /// step. The cursor and anchor stay on their rows, clamped to whatever
+     /// length the rows have afterwards.
+     pub fn map_selected_lines(&mut self, f: impl Fn(&str) -> String) {
+-        let (from, to) = self.selected_rows();
+-        self.record(EditKind::Other);
+-        for row in from..=to {
+-            let new = f(&self.lines[row]);
+-            self.lines[row] = new;
+-        }
+-        self.cursor = self.clamp(self.cursor);
+-        self.anchor = self.anchor.map(|a| self.clamp(a));
+-        self.follow_cursor = true;
++        self.tracked(|e| {
++            let (from, to) = e.selected_rows();
++            e.record(EditKind::Other);
++            for row in from..=to {
++                let new = f(&e.lines[row]);
++                e.lines[row] = new;
++            }
++            e.cursor = e.clamp(e.cursor);
++            e.anchor = e.anchor.map(|a| e.clamp(a));
++            e.follow_cursor = true;
++        })
+     }
+ 
+     /// Swap the selected rows (or the cursor row) with the line beyond them,
+     /// carrying the cursor and the selection along. False at either edge.
+     pub fn move_selected_lines(&mut self, down: bool) -> bool {
++        self.tracked(|e| e.move_selected_lines_raw(down))
++    }
++
++    fn move_selected_lines_raw(&mut self, down: bool) -> bool {
+         let (from, to) = self.selected_rows();
+         let can = if down {
+             to + 1 < self.lines.len()
+@@ -377,8 +417,10 @@ impl Editor {
+         if self.selection().is_none() {
+             return false;
+         }
+-        self.record(EditKind::Other);
+-        self.remove_selection()
++        self.tracked(|e| {
++            e.record(EditKind::Other);
++            e.remove_selection()
++        })
+     }
+ 
+     /// The selection removal itself, without touching the undo history: the
+@@ -396,6 +438,11 @@ impl Editor {
+     }
+ 
+     pub fn insert_char(&mut self, c: char) {
++        // typing over several lines joins them
++        if self.selection().is_some_and(|(a, b)| a.0 != b.0) {
++            self.tracked(|e| e.insert_char(c));
++            return;
++        }
+         self.record(EditKind::Type);
+         // a run of word characters is one undo step; anything else ends it
+         if !c.is_alphanumeric() {
+@@ -409,23 +456,29 @@ impl Editor {
+ 
+     /// Insert arbitrary text at the cursor, newlines and all (a paste).
+     pub fn insert_str(&mut self, text: &str) {
+-        self.record(EditKind::Other);
+-        self.batch += 1;
+-        self.remove_selection();
+-        for (i, part) in text.replace("\r\n", "\n").split('\n').enumerate() {
+-            if i > 0 {
+-                self.insert_newline();
+-            }
+-            for c in part.chars() {
+-                if c != '\r' {
+-                    self.insert_char(c);
++        self.tracked(|e| {
++            e.record(EditKind::Other);
++            e.batch += 1;
++            e.remove_selection();
++            for (i, part) in text.replace("\r\n", "\n").split('\n').enumerate() {
++                if i > 0 {
++                    e.insert_newline();
++                }
++                for c in part.chars() {
++                    if c != '\r' {
++                        e.insert_char(c);
++                    }
+                 }
+             }
+-        }
+-        self.batch -= 1;
++            e.batch -= 1;
++        })
+     }
+ 
+     pub fn insert_newline(&mut self) {
++        self.tracked(Self::insert_newline_raw)
++    }
++
++    fn insert_newline_raw(&mut self) {
+         self.record(EditKind::Other);
+         self.batch += 1;
+         self.remove_selection();
+@@ -443,12 +496,18 @@ impl Editor {
+     /// so a double Enter ends the list. Anywhere but the end of a line this
+     /// is a plain newline.
+     pub fn insert_newline_continuing_list(&mut self) {
++        self.tracked(Self::insert_newline_continuing_list_raw)
++    }
++
++    fn insert_newline_continuing_list_raw(&mut self) {
+         let (row, col) = self.cursor;
+         if self.anchor.is_some() || col != self.line_len(row) {
+             self.insert_newline();
+             return;
+         }
+-        let Some((prefix, body_empty)) = list_continuation(&self.lines[row]) else {
++        // a list that numbers every item the same goes on doing so
++        let same = crate::listnum::repeats_number(&self.lines, row);
++        let Some((prefix, body_empty)) = list_continuation_as(&self.lines[row], same) else {
+             self.insert_newline();
+             return;
+         };
+@@ -467,6 +526,58 @@ impl Editor {
+         self.last_kind = None;
+     }
+ 
++    fn is_list_item(&self, row: usize) -> bool {
++        matches!(crate::listnum::parse(&self.lines[row]).kind, crate::listnum::Kind::Item(_))
++    }
++
++    /// Tab and Shift+Tab on the selected rows (or the cursor's): an item goes
++    /// under the one above it, or back out from under it, with whatever is
++    /// nested in it. One undo step. False when nothing could move.
++    fn nest(&mut self, out: bool) -> bool {
++        let (from, to) = self.selected_rows();
++        let mut lines = self.lines.clone();
++        let tab = self.tab_width.max(1);
++        let shifts = if out {
++            let any_item = (from..=to).any(|r| self.is_list_item(r));
++            if !any_item {
++                // plain text: just take back what Tab put in
++                let mut shifts = Vec::new();
++                for row in from..=to {
++                    let ws = lines[row].len() - lines[row].trim_start_matches([' ', '\t']).len();
++                    let take = if lines[row].starts_with('\t') {
++                        1
++                    } else {
++                        lines[row][..ws].len().min(tab)
++                    };
++                    if take > 0 {
++                        lines[row].replace_range(..take, "");
++                        shifts.push(crate::listnum::Shift {
++                            row,
++                            at: 0,
++                            delta: -(take as isize),
++                        });
++                    }
++                }
++                shifts
++            } else {
++                crate::listnum::outdent(&mut lines, from, to, tab)
++            }
++        } else {
++            crate::listnum::indent(&mut lines, from, to, tab)
++        };
++        if shifts.is_empty() {
++            return false;
++        }
++        self.tracked(|e| {
++            e.record(EditKind::Other);
++            e.lines = lines;
++            e.follow_shifts(&shifts);
++            e.follow_cursor = true;
++            e.last_kind = None;
++        });
++        true
++    }
++
+     /// Char range of the cluster the char at `col` belongs to, when that
+     /// cluster is a ZWJ sequence or a flag; `col..col + 1` otherwise.
+     fn cluster_at(&self, row: usize, col: usize) -> (usize, usize) {
+@@ -481,6 +592,10 @@ impl Editor {
+     }
+ 
+     pub fn backspace(&mut self) {
++        self.tracked(Self::backspace_raw)
++    }
++
++    fn backspace_raw(&mut self) {
+         self.record(EditKind::Delete);
+         if self.remove_selection() {
+             return;
+@@ -499,6 +614,10 @@ impl Editor {
+     }
+ 
+     pub fn delete_forward(&mut self) {
++        self.tracked(Self::delete_forward_raw)
++    }
++
++    fn delete_forward_raw(&mut self) {
+         self.record(EditKind::Delete);
+         if self.remove_selection() {
+             return;
+@@ -539,10 +658,12 @@ impl Editor {
+     /// On an already-empty prefix this joins with the previous line, like a
+     /// plain backspace, so the key is never a no-op mid-buffer.
+     pub fn delete_to_line_start(&mut self) {
+-        self.record(EditKind::Other);
+-        self.batch += 1;
+-        self.kill_to_line_start();
+-        self.batch -= 1;
++        self.tracked(|e| {
++            e.record(EditKind::Other);
++            e.batch += 1;
++            e.kill_to_line_start();
++            e.batch -= 1;
++        })
+     }
+ 
+     fn kill_to_line_start(&mut self) {
+@@ -562,10 +683,12 @@ impl Editor {
+ 
+     /// Delete the word before the cursor (Option+Backspace).
+     pub fn delete_prev_word(&mut self) {
+-        self.record(EditKind::Delete);
+-        self.batch += 1;
+-        self.kill_prev_word();
+-        self.batch -= 1;
++        self.tracked(|e| {
++            e.record(EditKind::Delete);
++            e.batch += 1;
++            e.kill_prev_word();
++            e.batch -= 1;
++        })
+     }
+ 
+     fn kill_prev_word(&mut self) {
+@@ -640,7 +763,13 @@ impl Editor {
+                 self.delete_forward();
+                 return true;
+             }
++            KeyCode::BackTab => return self.nest(true),
++            KeyCode::Tab if select => return self.nest(true),
+             KeyCode::Tab => {
++                let (from, to) = self.selected_rows();
++                if (from..=to).any(|r| self.is_list_item(r)) {
++                    return self.nest(false);
++                }
+                 for _ in 0..self.tab_width.max(1) {
+                     self.insert_char(' ');
+                 }
+@@ -787,12 +916,19 @@ impl Editor {
+ 
+ /// If `line` is a list item, the prefix its successor should start with and
+ /// whether the item has no text after its marker.
++#[allow(dead_code)]
+ fn list_continuation(line: &str) -> Option<(String, bool)> {
++    list_continuation_as(line, false)
++}
++
++/// [`list_continuation`], with the next numbered item given the number of this
++/// one (`same`) rather than the one after it.
++fn list_continuation_as(line: &str, same: bool) -> Option<(String, bool)> {
+     let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+     let (indent, rest) = line.split_at(indent_len);
+     // a quote (or callout) line carries its `> ` on, and an empty one ends it
+     if let Some(body) = rest.strip_prefix("> ").or_else(|| rest.strip_prefix('>')) {
+-        if let Some(inner) = list_continuation(body) {
++        if let Some(inner) = list_continuation_as(body, same) {
+             return Some((format!("{indent}> {}", inner.0), inner.1));
+         }
+         return Some((format!("{indent}> "), body.trim().is_empty()));
+@@ -821,7 +957,7 @@ fn list_continuation(line: &str) -> Option<(String, bool)> {
+         let punct = after.chars().next().filter(|c| matches!(c, '.' | ')'))?;
+         let body = after[1..].strip_prefix(' ')?;
+         let n: u64 = rest[..digits].parse().ok()?;
+-        (format!("{}{punct} ", n + 1), body)
++        (format!("{}{punct} ", if same { n } else { n + 1 }), body)
+     };
+     Some((format!("{indent}{marker}"), body.trim().is_empty()))
+ }
+@@ -1341,4 +1477,161 @@ mod tests {
+         e.backspace();
+         assert_eq!(e.text(), "caf");
+     }
++
++    fn numbered(n: usize) -> String {
++        (1..=n).map(|i| format!("{i}. item {i}")).collect::<Vec<_>>().join("\n")
++    }
++
++    #[test]
++    fn pasting_a_list_under_another_carries_the_numbers_on() {
++        let mut e = Editor::new(&format!("{}\n\n", numbered(7)));
++        e.set_cursor((7, 0));
++        e.insert_str(&format!("{}\n", numbered(5)));
++        assert_eq!(
++            e.text(),
++            format!("{}\n8. item 1\n9. item 2\n10. item 3\n11. item 4\n12. item 5\n\n", numbered(7))
++        );
++    }
++
++    #[test]
++    fn enter_in_the_middle_of_a_list_renumbers_below() {
++        let mut e = Editor::new(&numbered(4));
++        e.set_cursor((1, 9));
++        e.insert_newline_continuing_list();
++        assert_eq!(e.text(), "1. item 1\n2. item 2\n3. \n4. item 3\n5. item 4");
++        assert_eq!(e.cursor, (2, 3));
++        assert!(e.undo());
++        assert_eq!(e.text(), numbered(4));
++    }
++
++    #[test]
++    fn deleting_and_moving_items_renumbers() {
++        let mut e = Editor::new(&numbered(4));
++        e.anchor = Some((1, 0));
++        e.cursor = (2, 0);
++        e.delete_selection();
++        assert_eq!(e.text(), "1. item 1\n2. item 3\n3. item 4".replace("item 3", "item 3"));
++        let mut e = Editor::new(&numbered(3));
++        e.set_cursor((0, 3));
++        assert!(e.move_selected_lines(true));
++        assert_eq!(e.text(), "1. item 2\n2. item 1\n3. item 3");
++        assert!(e.move_selected_lines(true));
++        assert_eq!(e.text(), "1. item 2\n2. item 3\n3. item 1");
++        assert!(e.move_selected_lines(false));
++        assert_eq!(e.text(), "1. item 2\n2. item 1\n3. item 3");
++        // deleting the first item keeps the list's start
++        let mut e = Editor::new("5. a\n6. b\n7. c");
++        e.anchor = Some((0, 0));
++        e.cursor = (1, 0);
++        e.delete_selection();
++        assert_eq!(e.text(), "5. b\n6. c");
++        // a number retyped on the first item is the new start
++        let mut e = Editor::new("1. a\n2. b\n3. c");
++        e.set_cursor((0, 1));
++        e.backspace();
++        e.insert_char('4');
++        assert_eq!(e.text(), "4. a\n2. b\n3. c");
++    }
++
++    #[test]
++    fn lists_that_repeat_a_number_and_other_lists_are_left_alone() {
++        let mut e = Editor::new("1. a\n1. b\n1. c\n\ntext\n\n3. x\n9. y");
++        e.set_cursor((1, 4));
++        e.insert_newline_continuing_list();
++        assert_eq!(e.text(), "1. a\n1. b\n1. \n1. c\n\ntext\n\n3. x\n9. y");
++        assert_eq!(e.cursor, (2, 3));
++        e.anchor = Some((1, 0));
++        e.cursor = (2, 0);
++        e.delete_selection();
++        assert_eq!(e.text(), "1. a\n1. \n1. c\n\ntext\n\n3. x\n9. y");
++    }
++
++    #[test]
++    fn only_the_list_being_edited_is_renumbered() {
++        let mut e = Editor::new("1. a\n2. b\n\ntext\n\n4. x\n9. y\n\n1. p\n2. q");
++        e.anchor = Some((0, 0));
++        e.cursor = (1, 0);
++        e.delete_selection();
++        assert_eq!(e.text(), "2. b\n\ntext\n\n4. x\n9. y\n\n1. p\n2. q".replace("2. b", "1. b"));
++    }
++
++    #[test]
++    fn tab_nests_an_item_with_what_is_under_it_and_shift_tab_brings_it_back() {
++        let tab = key(KeyCode::Tab, KeyModifiers::NONE);
++        let back = key(KeyCode::BackTab, KeyModifiers::SHIFT);
++        let mut e = Editor::new("1. a\n2. b\n   1. c\n3. d");
++        e.set_cursor((1, 4));
++        assert!(e.on_key(tab));
++        assert_eq!(e.text(), "1. a\n  1. b\n     1. c\n2. d");
++        assert_eq!(e.cursor, (1, 6));
++        assert!(e.on_key(back));
++        assert_eq!(e.text(), "1. a\n2. b\n   1. c\n3. d");
++        assert_eq!(e.cursor, (1, 4));
++        // the first item has nothing to go under
++        e.set_cursor((0, 4));
++        assert!(!e.on_key(tab));
++        assert_eq!(e.text(), "1. a\n2. b\n   1. c\n3. d");
++        // joining a list that is already there
++        e.set_cursor((3, 4));
++        assert!(e.on_key(tab));
++        assert_eq!(e.text(), "1. a\n2. b\n   1. c\n   2. d");
++        // a plain line still takes spaces
++        let mut e = Editor::new("abc");
++        e.on_key(tab);
++        assert_eq!(e.text(), "  abc");
++    }
++
++    #[test]
++    fn shift_tab_hands_the_items_after_it_to_it() {
++        let back = key(KeyCode::BackTab, KeyModifiers::SHIFT);
++        let mut e = Editor::new("1. a\n   1. b\n   2. c\n   3. d");
++        e.set_cursor((2, 6));
++        assert!(e.on_key(back));
++        assert_eq!(e.text(), "1. a\n   1. b\n2. c\n   1. d");
++        assert!(!e.on_key(back) || e.text() != "");
++    }
++
++    #[test]
++    fn a_first_nested_item_starts_at_one_and_the_list_it_left_closes_up() {
++        let tab = key(KeyCode::Tab, KeyModifiers::NONE);
++        let mut e = Editor::new("1. a\n2. b\n3. c");
++        e.set_cursor((1, 4));
++        e.on_key(tab);
++        assert_eq!(e.text(), "1. a\n  1. b\n2. c");
++        assert!(e.undo());
++        assert_eq!(e.text(), "1. a\n2. b\n3. c");
++        // a selection nests every item in it
++        e.anchor = Some((1, 0));
++        e.cursor = (2, 2);
++        assert!(e.on_key(tab));
++        assert_eq!(e.text(), "1. a\n  1. b\n  2. c");
++    }
++
++    #[test]
++    fn the_cursor_follows_a_number_that_grows_a_digit() {
++        let mut e = Editor::new(&numbered(9));
++        e.set_cursor((3, 9));
++        e.insert_newline_continuing_list();
++        e.set_cursor((8, 9));
++        e.insert_newline_continuing_list();
++        assert_eq!(e.lines().len(), 11);
++        assert_eq!(e.lines()[10], "11. item 9");
++        e.set_cursor((10, 4));
++        e.insert_newline();
++        assert_eq!(e.lines()[10], "11. ");
++    }
++
++    #[test]
++    fn quoted_lists_and_code_fences() {
++        let mut e = Editor::new("> 1. a\n> 2. b\n> 3. c");
++        e.anchor = Some((1, 0));
++        e.cursor = (2, 0);
++        e.delete_selection();
++        assert_eq!(e.text(), "> 1. a\n> 2. c");
++        let mut e = Editor::new("```\n1. a\n3. b\n4. c\n```");
++        e.anchor = Some((1, 0));
++        e.cursor = (2, 0);
++        e.delete_selection();
++        assert_eq!(e.text(), "```\n3. b\n4. c\n```");
++    }
+ }
+diff --git a/src/listnum.rs b/src/listnum.rs
+new file mode 100644
+index 0000000..b3f7079
+--- /dev/null
++++ b/src/listnum.rs
+@@ -0,0 +1,560 @@
++//! Lists in the buffer: who belongs to which list, the numbers of an ordered
++//! one, and nesting an item under the one above it.
++//!
++//! Everything here is a pure function over the buffer's lines. The editor
++//! calls [`renumber_after`] once an edit is done, with the lines as they were
++//! before it, and calls [`indent`] / [`outdent`] for Tab and Shift+Tab.
++
++/// A list item's marker.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Item {
++    pub ordered: bool,
++    /// `.` or `)` for a numbered item, the bullet itself otherwise.
++    pub delim: char,
++    pub num: u64,
++    /// Byte range of the digits in the line; empty for a bullet.
++    pub at: usize,
++    pub end: usize,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum Kind {
++    Blank,
++    Item(Item),
++    Other,
++}
++
++/// One line, taken apart.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Parsed {
++    /// How many `>` bars the line sits behind.
++    pub quote: usize,
++    /// Byte length of those bars.
++    pub prefix: usize,
++    /// Byte length of the whitespace after them.
++    pub indent: usize,
++    /// That whitespace in columns, a tab being two like the renderer has it.
++    pub width: usize,
++    pub kind: Kind,
++}
++
++pub fn parse(line: &str) -> Parsed {
++    let mut quote = 0;
++    let mut prefix = 0;
++    loop {
++        let t = line[prefix..].trim_start_matches(' ');
++        let Some(after) = t.strip_prefix('>') else {
++            break;
++        };
++        quote += 1;
++        prefix = line.len() - after.len();
++        if line[prefix..].starts_with(' ') {
++            prefix += 1;
++        }
++    }
++    let rest = &line[prefix..];
++    let body = rest.trim_start_matches([' ', '\t']);
++    let indent = rest.len() - body.len();
++    let width = rest[..indent].chars().map(|c| if c == '\t' { 2 } else { 1 }).sum();
++    let kind = if body.is_empty() {
++        Kind::Blank
++    } else if let Some(item) = item_of(body, prefix + indent) {
++        Kind::Item(item)
++    } else {
++        Kind::Other
++    };
++    Parsed {
++        quote,
++        prefix,
++        indent,
++        width,
++        kind,
++    }
++}
++
++/// The marker `body` starts with; `base` is where `body` begins in its line.
++fn item_of(body: &str, base: usize) -> Option<Item> {
++    let first = body.chars().next()?;
++    if matches!(first, '-' | '*' | '+') {
++        return body[1..].starts_with(' ').then_some(Item {
++            ordered: false,
++            delim: first,
++            num: 0,
++            at: base,
++            end: base,
++        });
++    }
++    let digits = body.len() - body.trim_start_matches(|c: char| c.is_ascii_digit()).len();
++    if digits == 0 || digits > 9 {
++        return None;
++    }
++    let after = &body[digits..];
++    let delim = after.chars().next().filter(|c| matches!(c, '.' | ')'))?;
++    after[1..].starts_with(' ').then_some(Item {
++        ordered: true,
++        delim,
++        num: body[..digits].parse().ok()?,
++        at: base,
++        end: base + digits,
++    })
++}
++
++/// A run of sibling items: same bar depth, same indent, same kind of marker.
++#[derive(Clone, Debug)]
++pub struct List {
++    pub quote: usize,
++    pub width: usize,
++    pub ordered: bool,
++    pub delim: char,
++    /// Rows of the items, in order.
++    pub items: Vec<usize>,
++    /// The item this list is nested under, when it is nested.
++    pub parent: Option<usize>,
++    /// The last row that belongs to the list, nested lines included.
++    pub last: usize,
++}
++
++impl List {
++    fn same_kind(&self, quote: usize, width: usize, item: &Item) -> bool {
++        self.quote == quote
++            && self.width == width
++            && self.ordered == item.ordered
++            && self.delim == item.delim
++    }
++}
++
++/// Every list in the buffer, outer ones before the lists nested in them. Fenced
++/// code is not list.
++pub fn lists(lines: &[String]) -> Vec<List> {
++    let mut all: Vec<List> = Vec::new();
++    let mut stack: Vec<usize> = Vec::new();
++    let mut fence = false;
++    for (i, text) in lines.iter().enumerate() {
++        if fence {
++            fence = !crate::md::is_fence(text);
++            for &s in &stack {
++                all[s].last = i;
++            }
++            continue;
++        }
++        let line = parse(text);
++        if line.kind == Kind::Blank {
++            continue;
++        }
++        while stack.last().is_some_and(|&s| all[s].quote != line.quote) {
++            stack.pop();
++        }
++        match &line.kind {
++            Kind::Item(item) => {
++                while stack.last().is_some_and(|&s| all[s].width > line.width) {
++                    stack.pop();
++                }
++                match stack.last().copied() {
++                    Some(s) if all[s].same_kind(line.quote, line.width, item) => {
++                        all[s].items.push(i);
++                    }
++                    top => {
++                        // a sibling of another kind ends that list; anything
++                        // wider than the top one is nested in its last item
++                        let parent = match top {
++                            Some(s) if all[s].width == line.width => {
++                                stack.pop();
++                                stack.last().map(|&p| *all[p].items.last().unwrap())
++                            }
++                            Some(s) => Some(*all[s].items.last().unwrap()),
++                            None => None,
++                        };
++                        all.push(List {
++                            quote: line.quote,
++                            width: line.width,
++                            ordered: item.ordered,
++                            delim: item.delim,
++                            items: vec![i],
++                            parent,
++                            last: i,
++                        });
++                        stack.push(all.len() - 1);
++                    }
++                }
++            }
++            _ => {
++                while stack.last().is_some_and(|&s| all[s].width >= line.width) {
++                    stack.pop();
++                }
++                fence = crate::md::is_fence(text);
++            }
++        }
++        for &s in &stack {
++            all[s].last = i;
++        }
++    }
++    all
++}
++
++/// The last row of the item on `row` and everything under it: the lines after
++/// it that are indented further, blank lines between them included.
++pub fn subtree_end(lines: &[String], row: usize) -> usize {
++    let me = parse(&lines[row]);
++    let mut end = row;
++    let mut fence = false;
++    for (j, text) in lines.iter().enumerate().skip(row + 1) {
++        if fence {
++            fence = !crate::md::is_fence(text);
++            end = j;
++            continue;
++        }
++        let line = parse(text);
++        if line.kind == Kind::Blank {
++            continue;
++        }
++        if line.quote != me.quote || line.width <= me.width {
++            break;
++        }
++        fence = crate::md::is_fence(text);
++        end = j;
++    }
++    end
++}
++
++/// The list the item on `row` is in.
++fn list_of(all: &[List], row: usize) -> Option<&List> {
++    all.iter().find(|l| l.items.contains(&row))
++}
++
++fn item_at(lines: &[String], row: usize) -> Option<Item> {
++    match parse(&lines[row]).kind {
++        Kind::Item(item) => Some(item),
++        _ => None,
++    }
++}
++
++/// Whether the numbered list the item on `row` is in repeats one number
++/// (`1.` on every item): the style to keep going when a new item is added.
++pub fn repeats_number(lines: &[String], row: usize) -> bool {
++    let all = lists(lines);
++    match list_of(&all, row) {
++        Some(l) if l.ordered => repeating(lines, &l.items),
++        _ => false,
++    }
++}
++
++fn repeating(lines: &[String], rows: &[usize]) -> bool {
++    let mut nums = rows.iter().filter_map(|&r| item_at(lines, r)).map(|i| i.num);
++    let Some(first) = nums.next() else {
++        return false;
++    };
++    rows.len() > 1 && nums.all(|n| n == first)
++}
++
++/// Where a column on a row lands after an edit to that row: from `at` on,
++/// columns move by `delta` (but never back past `at`).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Shift {
++    pub row: usize,
++    pub at: usize,
++    pub delta: isize,
++}
++
++impl Shift {
++    pub fn apply(&self, col: usize) -> usize {
++        if col < self.at {
++            col
++        } else {
++            col.saturating_add_signed(self.delta).max(self.at)
++        }
++    }
++}
++
++fn chars_to(line: &str, byte: usize) -> usize {
++    line[..byte].chars().count()
++}
++
++/// Write `num` over the digits of the item on `row`.
++fn set_number(lines: &mut [String], row: usize, num: u64) -> Option<Shift> {
++    let item = item_at(lines, row)?;
++    if !item.ordered || item.num == num {
++        return None;
++    }
++    let digits = num.to_string();
++    let delta = digits.len() as isize - (item.end - item.at) as isize;
++    let at = if delta >= 0 { item.end } else { item.at + digits.len() };
++    let at = chars_to(&lines[row], at);
++    lines[row].replace_range(item.at..item.end, &digits);
++    Some(Shift { row, at, delta })
++}
++
++/// What decides whether an edit to a line can have moved a number: the line's
++/// place in a list, not its words.
++fn shape(line: &str) -> (usize, usize, Option<(bool, char, u64)>) {
++    let p = parse(line);
++    let item = match p.kind {
++        Kind::Item(i) => Some((i.ordered, i.delim, i.num)),
++        _ => None,
++    };
++    (p.quote, p.width, item)
++}
++
++/// Put the numbers of the ordered lists an edit touched back in order. `before`
++/// is the buffer as it was; `lines` is the buffer as the edit left it.
++///
++/// A list counts from the number it starts at, so `5. 6. 7.` stays at 5, and a
++/// list whose items all carry one number (`1.` throughout) is left alone. A
++/// list the edit did not reach is left alone too.
++pub fn renumber_after(before: &[String], lines: &mut [String]) -> Vec<Shift> {
++    let (nb, na) = (before.len(), lines.len());
++    let mut p = 0;
++    while p < nb.min(na) && before[p] == lines[p] {
++        p += 1;
++    }
++    if p == nb && p == na {
++        return Vec::new();
++    }
++    let mut s = 0;
++    while s < nb.min(na) - p && before[nb - 1 - s] == lines[na - 1 - s] {
++        s += 1;
++    }
++    let new_end = na - s;
++    if na == nb && (p..new_end).all(|r| shape(&before[r]) == shape(&lines[r])) {
++        return Vec::new();
++    }
++    if na == 0 {
++        return Vec::new();
++    }
++    // the rows an edit can have changed the numbering around: the changed
++    // ones and the line either side of them
++    let (lo, hi) = (p.saturating_sub(1), new_end.min(na - 1));
++    let new_lists = lists(lines);
++    let mut old_lists: Option<Vec<List>> = None;
++    let mut shifts = Vec::new();
++    for list in &new_lists {
++        if !list.ordered || !list.items.iter().any(|r| (lo..=hi).contains(r))
++        {
++            continue;
++        }
++        // told apart from the new ones by what they were before the edit
++        let untouched: Vec<usize> = list
++            .items
++            .iter()
++            .copied()
++            .filter(|r| !(p..new_end).contains(r))
++            .collect();
++        if repeating(lines, if untouched.len() >= 2 { &untouched } else { &list.items }) {
++            continue;
++        }
++        let first = list.items[0];
++        let mut start = item_at(lines, first).map_or(0, |i| i.num);
++        // a first item that was moved or deleted takes the old start with it
++        if (p..=new_end).contains(&first) {
++            let old = old_lists.get_or_insert_with(|| lists(before));
++            let row = if first >= new_end { first + nb - na } else { p };
++            // unless one line was edited where it stands: a number being
++            // retyped is the list's new start, not an item that went away
++            let retyped = nb == na && new_end - p == 1;
++            let old_list = old.iter().find(|o| {
++                !retyped
++                    && o.ordered == list.ordered
++                    && o.delim == list.delim
++                    && o.quote == list.quote
++                    && o.width == list.width
++                    && o.items[0] >= p
++                    && o.items[0] <= row
++                    && row <= o.last
++            });
++            if let Some(o) = old_list {
++                let body = |ls: &[String], r: usize| {
++                    item_at(ls, r).map(|i| ls[r][i.end..].to_string())
++                };
++                let survived = o.items.iter().any(|&r| body(before, r) == body(lines, first));
++                if survived {
++                    start = item_at(before, o.items[0]).map_or(start, |i| i.num);
++                }
++            }
++        }
++        for (k, &row) in list.items.iter().enumerate() {
++            if let Some(shift) = set_number(lines, row, start.saturating_add(k as u64)) {
++                shifts.push(shift);
++            }
++        }
++    }
++    shifts
++}
++
++/// Nest the items on `from..=to` under the item above each, taking whatever is
++/// nested in them along. An item with nothing above it in its list stays.
++/// Returns where the lines' columns moved; empty when nothing did.
++pub fn indent(lines: &mut [String], from: usize, to: usize, tab: usize) -> Vec<Shift> {
++    let all = lists(lines);
++    let mut moved: Vec<(usize, usize, String)> = Vec::new();
++    let mut covered = 0;
++    for r in from..=to.min(lines.len().saturating_sub(1)) {
++        if r < covered {
++            continue;
++        }
++        let Some(list) = list_of(&all, r) else {
++            continue;
++        };
++        let k = list.items.iter().position(|&x| x == r).unwrap();
++        if k == 0 {
++            continue;
++        }
++        let prev = list.items[k - 1];
++        // follow the way the item above already nests its own, if it does
++        let raw = |row: usize| {
++            let p = parse(&lines[row]);
++            lines[row][p.prefix..p.prefix + p.indent].to_string()
++        };
++        let parent_indent = raw(prev);
++        let add = all
++            .iter()
++            .find(|l| l.parent == Some(prev))
++            .map(|l| raw(l.items[0]))
++            .and_then(|child| child.strip_prefix(&parent_indent).map(String::from))
++            .filter(|a| !a.is_empty())
++            .unwrap_or_else(|| " ".repeat(tab.max(1)));
++        let end = subtree_end(lines, r);
++        covered = end + 1;
++        moved.push((r, end, add));
++    }
++    let mut shifts = Vec::new();
++    for (r, end, add) in &moved {
++        for row in *r..=*end {
++            let p = parse(&lines[row]);
++            if p.kind == Kind::Blank {
++                continue;
++            }
++            let at = p.prefix + p.indent;
++            lines[row].insert_str(at, add);
++            shifts.push(Shift {
++                row,
++                at: chars_to(&lines[row], at),
++                delta: add.chars().count() as isize,
++            });
++        }
++    }
++    // an item that now opens a list of its own starts it at 1
++    let all = lists(lines);
++    for (r, _, _) in &moved {
++        if list_of(&all, *r).is_some_and(|l| l.items[0] == *r) {
++            shifts.extend(set_number(lines, *r, 1));
++        }
++    }
++    shifts
++}
++
++/// Bring the items on `from..=to` out one level, to where the item they are
++/// nested under stands, with whatever is nested in them. Whatever followed them
++/// in their list stays where it was, and so is now under them.
++pub fn outdent(lines: &mut [String], from: usize, to: usize, tab: usize) -> Vec<Shift> {
++    let all = lists(lines);
++    let mut moved: Vec<(usize, usize, usize)> = Vec::new();
++    let mut covered = 0;
++    for r in from..=to.min(lines.len().saturating_sub(1)) {
++        if r < covered {
++            continue;
++        }
++        let p = parse(&lines[r]);
++        if p.indent == 0 || p.kind == Kind::Blank {
++            continue;
++        }
++        let indent = &lines[r][p.prefix..p.prefix + p.indent];
++        let by = match (&p.kind, list_of(&all, r).and_then(|l| l.parent)) {
++            (Kind::Item(_), Some(parent)) => {
++                let q = parse(&lines[parent]);
++                let up = &lines[parent][q.prefix..q.prefix + q.indent];
++                if q.quote == p.quote && indent.starts_with(up) && up.len() < indent.len() {
++                    indent.chars().count() - up.chars().count()
++                } else {
++                    strip_len(indent, tab)
++                }
++            }
++            _ => strip_len(indent, tab),
++        };
++        let end = if matches!(p.kind, Kind::Item(_)) {
++            subtree_end(lines, r)
++        } else {
++            r
++        };
++        covered = end + 1;
++        moved.push((r, end, by));
++    }
++    let mut shifts = Vec::new();
++    for &(r, end, by) in &moved {
++        for row in r..=end {
++            let p = parse(&lines[row]);
++            if p.kind == Kind::Blank {
++                continue;
++            }
++            let ws = &lines[row][p.prefix..p.prefix + p.indent];
++            let take: usize = ws.chars().take(by).map(char::len_utf8).sum();
++            let removed = ws[..take].chars().count();
++            lines[row].replace_range(p.prefix..p.prefix + take, "");
++            if removed > 0 {
++                shifts.push(Shift {
++                    row,
++                    at: chars_to(&lines[row], p.prefix),
++                    delta: -(removed as isize),
++                });
++            }
++        }
++    }
++    // what followed an item out of its list now opens a list under it
++    let all = lists(lines);
++    for &(_, end, _) in &moved {
++        let Some(next) = (end + 1..lines.len()).find(|&j| parse(&lines[j]).kind != Kind::Blank)
++        else {
++            continue;
++        };
++        if moved.iter().any(|&(r, e, _)| (r..=e).contains(&next)) {
++            continue;
++        }
++        if list_of(&all, next).is_some_and(|l| l.items[0] == next) {
++            shifts.extend(set_number(lines, next, 1));
++        }
++    }
++    shifts
++}
++
++/// How much of `indent` a plain outdent takes: a tab, or up to `tab` spaces.
++fn strip_len(indent: &str, tab: usize) -> usize {
++    if indent.starts_with('\t') {
++        1
++    } else {
++        indent.chars().take_while(|c| *c == ' ').count().min(tab.max(1))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn v(text: &str) -> Vec<String> {
++        text.lines().map(String::from).collect()
++    }
++
++    #[test]
++    fn items_and_their_widths() {
++        let p = parse("  12) x");
++        assert_eq!(p.width, 2);
++        assert!(matches!(p.kind, Kind::Item(Item { ordered: true, num: 12, delim: ')', .. })));
++        assert_eq!(parse("\t- x").width, 2);
++        assert_eq!(parse("> 3. x").quote, 1);
++        assert_eq!(parse("3.x").kind, Kind::Other);
++        assert_eq!(parse("  ").kind, Kind::Blank);
++    }
++
++    #[test]
++    fn lists_nest_and_end() {
++        let ls = lists(&v("1. a\n   1. b\n2. c\n\ntext\n1. d"));
++        assert_eq!(ls.len(), 3);
++        assert_eq!(ls[0].items, [0, 2]);
++        assert_eq!(ls[1].items, [1]);
++        assert_eq!(ls[1].parent, Some(0));
++        assert_eq!(ls[2].items, [5]);
++    }
++
++    #[test]
++    fn fenced_code_is_not_a_list() {
++        let ls = lists(&v("```\n1. a\n3. b\n```"));
++        assert!(ls.is_empty());
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index a2d1a97..6be9065 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -18,6 +18,7 @@ mod images;
+ mod index;
+ mod keys;
+ mod links;
++mod listnum;
+ mod md;
+ mod mentions;
+ mod mermaid;

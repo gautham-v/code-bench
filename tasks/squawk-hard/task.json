@@ -1,0 +1,76 @@
+{
+  "id": "squawk-hard",
+  "set": "hard",
+  "repo": "squawk",
+  "base": "e0ae37c4cead37dd7670d80b095ea8e1d3d0147a",
+  "fix": "e9a4315e5159d69feedc67945344d4eaa9aa5b84",
+  "kind": "feature",
+  "prompt": "Claude Code mode is still a stub: squawk_core::context finds no session and passes text through. Finish it. When I dictate into a terminal that has claude or codex running in it, squawk should find that session and its directory and use the repo on what I said. File names I say out loud should come out as @mentions Claude Code can open: \"take a look at status item dot rs\" should paste \"take a look at @src/status_item.rs\", and when two files share a name I say the folder too, \"context slash mod dot rs\". The repo's own terms should come out the way the repo writes them. A wrong @mention is worse than none: when it isn't sure, it leaves my words alone. The app and the CLI already call the API in context/mod.rs, so keep it and make it do what its comments say.",
+  "clone": [],
+  "env": {
+    "CARGO_TARGET_DIR": "{root}/target",
+    "CARGO_NET_OFFLINE": "true"
+  },
+  "warm": "cargo test -p squawk-core --no-run",
+  "protected": [
+    "crates/squawk-core/src/hotkey.rs",
+    "crates/squawk-core/src/ipc.rs",
+    "crates/squawk-core/src/paths.rs",
+    "crates/squawk-core/src/status.rs",
+    "crates/squawk-core/src/store/mod.rs",
+    "crates/squawk-core/src/store/dictation.rs",
+    "crates/squawk-core/src/store/meeting.rs"
+  ],
+  "checks": [
+    {
+      "name": "existing_tests_pass",
+      "cmd": "touch crates/squawk-core/src/lib.rs; set -o pipefail; cargo test -p squawk-core --lib -- --skip context:: cleanup:: config:: dictionary:: hotkey:: ipc:: paths:: pipeline:: status:: store:: text:: 2>&1 | tee /dev/stderr | grep -Eq 'test result: ok\\. (10[2-9]|1[1-9][0-9]|[2-9][0-9][0-9]) passed'",
+      "expect_base": "pass"
+    },
+    {
+      "name": "spoken_file_names_become_mentions",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_mentions",
+      "expect_base": "fail"
+    },
+    {
+      "name": "dotted_names_taken_whole",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_dotted",
+      "expect_base": "fail"
+    },
+    {
+      "name": "spoken_folder_has_to_match",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_folders",
+      "expect_base": "fail"
+    },
+    {
+      "name": "unsure_references_stay_as_spoken",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_unsure",
+      "expect_base": "fail"
+    },
+    {
+      "name": "protected_text_left_alone",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_protected",
+      "expect_base": "fail"
+    },
+    {
+      "name": "repo_terms_spelled_like_the_repo",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_jargon",
+      "expect_base": "fail"
+    },
+    {
+      "name": "vocab_lists_the_repos_files",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_vocab",
+      "expect_base": "fail"
+    },
+    {
+      "name": "vocab_cache_follows_the_repo",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_cache",
+      "expect_base": "fail"
+    },
+    {
+      "name": "finds_the_agent_session",
+      "cmd": "touch crates/squawk-core/src/lib.rs; GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test -p squawk-core --test heldout_detect",
+      "expect_base": "fail"
+    }
+  ]
+}

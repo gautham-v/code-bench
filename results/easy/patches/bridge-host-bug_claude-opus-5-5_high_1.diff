@@ -1,0 +1,267 @@
+diff --git a/docs/chat-panel.md b/docs/chat-panel.md
+index fa14250..6f2d646 100644
+--- a/docs/chat-panel.md
++++ b/docs/chat-panel.md
+@@ -62,6 +62,12 @@ Out of scope for now: turning connectors on and off per chat, and voice input.
+   rule Claude Code suggested (a connector tool's whole tool, a WebFetch `domain:host`), and with
+   none, Allow once only. `AskUserQuestion` is denied automatically, with a note to ask in plain
+   text.
++- Sub-agents (Claude Code's `Task` tool, `Agent` in newer versions): their messages carry
++  `parent_tool_use_id`. Their tool calls are reported like the agent's own, with `parent` on
++  `tool_start`; what they say (text, streamed or whole) and their API errors stay out of the chat,
++  and the reply reaches the panel as the `Task`/`Agent` step's `tool_end` summary. A transcript
++  loaded from history has that summary too, but not the sub-agent's own steps (they aren't in the
++  session file).
+ - A message sent while a turn is running is queued behind it (Claude Code queues it in the same
+   process; for Codex it waits for the running process to exit). Changing engine mid-turn ends the
+   running turn as interrupted.
+@@ -133,8 +139,8 @@ Events (`chat.event`'s `event`):
+ | `user` | `text`, `attachments: [{name, mime}]` (echo, so every panel shows it) |
+ | `text_delta` | `messageId` (`<api message id>:<n>` for the nth text block), `text` |
+ | `text` | `messageId` (same scheme), `text` (full text of a finished assistant text block) |
+-| `tool_start` | `toolUseId`, `name` (e.g. `mcp__firefox__navigate`), `summary` (short, no typed text, form values, script source, key sequences or URL queries; `ToolSearch` is not reported), `tabId` (Firefox tools that name a tab; the steps card says "Using Firefox in <site>" from the latest one) |
+-| `tool_end` | `toolUseId`, `ok`, `summary` (text only for failures, plus the first line of navigate and shell results; screenshots and page content never leave the host) |
++| `tool_start` | `toolUseId`, `name` (e.g. `mcp__firefox__navigate`), `summary` (short, no typed text, form values, script source, key sequences or URL queries; `ToolSearch` is not reported), `tabId` (Firefox tools that name a tab; the steps card says "Using Firefox in <site>" from the latest one), `parent` (only on a sub-agent's tool call: the `toolUseId` of the `Task`/`Agent` step it runs under; several sub-agents run at once, so their steps interleave) |
++| `tool_end` | `toolUseId`, `ok`, `summary` (text only for failures, plus the first line of navigate and shell results, and for a `Task`/`Agent` step the sub-agent's reply, at most 300 characters, without the `agentId:`/`<usage>` block Claude Code appends; screenshots and page content never leave the host) |
+ | `permission` | `requestId`, `tool`, `summary` (what would run, see Permissions), `always` (whether Always allow is offered; absent means yes) |
+ | `result` | `ok`, `durationMs`, `numTurns`, `error` (a short message when `ok` is false; every turn ends with one, including failed starts) |
+ | `error` | `code`: `not_found` \| `auth` \| `limit` \| `spawn` \| `crashed`, `message`, `resetsAt` (epoch ms when a usage limit lifts and the engine said so, else null) |
+diff --git a/host/chat-format.mjs b/host/chat-format.mjs
+index a8a6a75..3e5859c 100644
+--- a/host/chat-format.mjs
++++ b/host/chat-format.mjs
+@@ -128,13 +128,29 @@ export function summarizePermission(tool, input) {
+   return fit(lines.join("\n"), CARD_INPUT_CHARS);
+ }
+ 
++// The tools that run a sub-agent (Task was renamed Agent). Their result is the sub-agent's reply.
++const SUBAGENT_TOOLS = new Set(["Task", "Agent"]);
++const SUBAGENT_REPLY_CHARS = 300;
++
++// Claude Code ends a sub-agent's result with a text block of its own ("agentId: ..." and a
++// <usage> block), which isn't something the sub-agent said.
++function withoutAgentTrailer(parts) {
++  const last = parts.at(-1);
++  const trailer = last?.type === "text" && typeof last.text === "string" && last.text.startsWith("agentId:") && last.text.includes("<usage>");
++  return trailer ? parts.slice(0, -1) : parts;
++}
++
+ // Result summaries: only errors carry text (the bridge already cuts typed values out of its error
+-// messages). Page content, script output and screenshots never leave the host.
++// messages), and a sub-agent's reply. Page content, script output and screenshots never leave the
++// host.
+ export function summarizeToolResult(name, content, isError) {
+-  const parts = Array.isArray(content) ? content : typeof content === "string" ? [{ type: "text", text: content }] : [];
++  const subagent = SUBAGENT_TOOLS.has(name);
++  const all = Array.isArray(content) ? content : typeof content === "string" ? [{ type: "text", text: content }] : [];
++  const parts = subagent ? withoutAgentTrailer(all) : all;
+   const text = parts.filter((p) => p?.type === "text").map((p) => p.text).join("\n");
+   const first = text.split("\n").find((l) => l.trim()) ?? "";
+   if (isError) return clip(first || "Failed", 120);
++  if (subagent) return clip(text, SUBAGENT_REPLY_CHARS);
+   if (parts.some((p) => p?.type === "image")) return /^mcp__firefox__computer$/.test(name) ? "Screenshot captured" : "Image";
+   if (/^mcp__firefox__(navigate|tabs_)/.test(name)) return clip(first, 100);
+   if (name === "Bash") return clip(first, 100);
+diff --git a/host/chat.mjs b/host/chat.mjs
+index 8c28938..382272a 100644
+--- a/host/chat.mjs
++++ b/host/chat.mjs
+@@ -425,8 +425,9 @@ export function createChat({ send, log = () => {}, home = os.homedir(), env = pr
+ 
+   function onClaude(c, p, j) {
+     if (c.proc !== p) return;
+-    // Sub-agent chatter stays out of the panel; only the top-level agent's work is shown.
+-    if (j.parent_tool_use_id && (j.type === "assistant" || j.type === "user" || j.type === "stream_event")) return;
++    // What a sub-agent says stays out of the chat; its tool calls are reported as steps under the
++    // Task/Agent step it runs in (see onClaudeAssistant).
++    if (j.parent_tool_use_id && j.type === "stream_event") return;
+     switch (j.type) {
+       case "stream_event":
+         return onClaudeStream(c, p, j.event);
+@@ -457,7 +458,10 @@ export function createChat({ send, log = () => {}, home = os.homedir(), env = pr
+ 
+   function onClaudeAssistant(c, p, j) {
+     const blocks = Array.isArray(j.message?.content) ? j.message.content : [];
++    const parent = typeof j.parent_tool_use_id === "string" && j.parent_tool_use_id ? j.parent_tool_use_id : null; // set on a sub-agent's messages
+     if (j.error || j.isApiErrorMessage) {
++      // A sub-agent's API failure comes back to the agent as its Task/Agent step's failed result.
++      if (parent) return;
+       // API failures arrive as an assistant message whose text is the error.
+       const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+       p.apiError = text;
+@@ -469,13 +473,14 @@ export function createChat({ send, log = () => {}, home = os.homedir(), env = pr
+       return;
+     }
+     for (const b of blocks) {
+-      if (b.type === "text" && b.text?.trim()) {
++      if (b.type === "text") {
++        if (parent || !b.text?.trim()) continue;
+         const n = p.texts.get(j.message.id) ?? 0;
+         p.texts.set(j.message.id, n + 1);
+         emitText(c, `${j.message.id}:${n}`, "text", b.text);
+       } else if (b.type === "tool_use" && !p.tools.has(b.id) && !HIDDEN_TOOLS.has(b.name)) {
+         p.tools.set(b.id, b.name);
+-        emit(c.id, { kind: "tool_start", toolUseId: b.id, name: b.name, summary: summarizeToolUse(b.name, b.input), ...toolTab(b.name, b.input) });
++        emit(c.id, { kind: "tool_start", toolUseId: b.id, ...(parent ? { parent } : {}), name: b.name, summary: summarizeToolUse(b.name, b.input), ...toolTab(b.name, b.input) });
+       }
+     }
+   }
+diff --git a/host/test/chat.test.mjs b/host/test/chat.test.mjs
+index 25a09db..a702ad4 100644
+--- a/host/test/chat.test.mjs
++++ b/host/test/chat.test.mjs
+@@ -231,6 +231,50 @@ test("claude: tool events carry short summaries that never include typed text, s
+   }
+ });
+ 
++test("claude: sub-agents' tool calls are steps under their Task/Agent step, which ends with the sub-agent's reply", async () => {
++  const t = setup();
++  try {
++    const id = newId();
++    await t.turn(id, "[agents] compare");
++    const ev = t.events(id);
++    assert.deepEqual(ev.filter((e) => e.kind === "tool_start").map((e) => [e.toolUseId, e.parent, e.name, e.summary, e.tabId]), [
++      ["toolu_agent_a", undefined, "Agent", "Read requests on PyPI", undefined],
++      ["toolu_agent_b", undefined, "Task", "Read httpx on PyPI", undefined],
++      ["toolu_agent_c", undefined, "Agent", "Read nothing", undefined],
++      ["toolu_a_tab", "toolu_agent_a", "mcp__firefox__tabs_create_mcp", "Open a new tab", undefined],
++      ["toolu_b_tab", "toolu_agent_b", "mcp__firefox__tabs_create_mcp", "Open a new tab", undefined],
++      ["toolu_b_nav", "toolu_agent_b", "mcp__firefox__navigate", "Open pypi.org/project/httpx/", 12],
++      ["toolu_a_nav", "toolu_agent_a", "mcp__firefox__navigate", "Open pypi.org/project/requests/", 11],
++    ]);
++    assert.ok(!("parent" in ev.find((e) => e.toolUseId === "toolu_agent_a")), "the agent's own steps have no parent");
++    const ends = ev.filter((e) => e.kind === "tool_end");
++    assert.deepEqual(ends.slice(0, 5).map((e) => [e.toolUseId, e.ok, e.summary]), [
++      ["toolu_b_tab", true, "Created tab 12"],
++      ["toolu_a_tab", true, "Created tab 11"],
++      ["toolu_a_nav", true, "Navigated to https://pypi.org/project/requests/"],
++      ["toolu_b_nav", true, "Navigated to https://pypi.org/project/httpx/"],
++      ["toolu_agent_a", true, "requests 2.32.3"],
++    ]);
++    const long = ends[5];
++    assert.equal(long.toolUseId, "toolu_agent_b");
++    assert.equal(long.summary.length, 300);
++    assert.match(long.summary, /^httpx 0\.28\.1 The page lists every release\. /);
++    assert.deepEqual(ends[6], { kind: "tool_end", toolUseId: "toolu_agent_c", ok: false, summary: "Agent failed: API Error: 529 overloaded" });
++    assert.deepEqual(ev.filter((e) => e.kind === "text").map((e) => e.text), ["requests is 2.32.3 and httpx is 0.28.1."], "what a sub-agent says stays out of the chat");
++    assert.ok(ev.filter((e) => e.kind === "text_delta").every((e) => !e.messageId.startsWith("msg_sub")));
++    assert.equal(ev.filter((e) => e.kind === "error").length, 0, "a sub-agent's API error isn't the chat's");
++    const all = JSON.stringify(ev);
++    for (const hidden of ["agentId", "<usage>", "utm=secret", "Opening the requests page"]) assert.ok(!all.includes(hidden), `${hidden} must not appear`);
++    assert.equal(t.results(id).at(-1).ok, true);
++
++    // Reopened from history, the steps end with the same replies.
++    const r = await t.ask("chat.load", { chatId: id, source: "panel" });
++    assert.deepEqual(r.items.filter((i) => i.kind === "tool_end").map((i) => [i.toolUseId, i.ok, i.summary]), ends.slice(4).map((e) => [e.toolUseId, e.ok, e.summary]));
++  } finally {
++    t.done();
++  }
++});
++
+ test("claude: permission prompts go to the panel; allow, deny and always-allow are honored", async () => {
+   const t = setup();
+   try {
+diff --git a/host/test/fake-claude.mjs b/host/test/fake-claude.mjs
+index e398fd4..e695ea8 100755
+--- a/host/test/fake-claude.mjs
++++ b/host/test/fake-claude.mjs
+@@ -64,16 +64,33 @@ async function assistantText(id, text, { deltas = true } = {}) {
+   write({ type: "stream_event", event: { type: "message_stop" }, parent_tool_use_id: null });
+ }
+ 
+-function toolUse(id, name, input) {
+-  write({ type: "assistant", message: { id: `msg_${id}`, role: "assistant", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: null, uuid: `u-${++counter}` });
+-  record({ type: "assistant", uuid: `a-${counter}`, message: { id: `msg_${id}`, role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
++// `parent` is the Task/Agent call a sub-agent's message belongs to. Sub-agents keep their own
++// transcript files, so only the top-level agent's messages go into the session file.
++function toolUse(id, name, input, parent = null) {
++  write({ type: "assistant", message: { id: `msg_${id}`, role: "assistant", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: parent, uuid: `u-${++counter}` });
++  if (!parent) record({ type: "assistant", uuid: `a-${counter}`, message: { id: `msg_${id}`, role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
+ }
+ 
+-function toolResult(id, content, isError = false) {
+-  write({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }] }, parent_tool_use_id: null });
+-  record({ type: "user", uuid: `r-${++counter}`, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }] } });
++function toolResult(id, content, isError = false, parent = null) {
++  write({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }] }, parent_tool_use_id: parent });
++  if (!parent) record({ type: "user", uuid: `r-${++counter}`, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }] } });
+ }
+ 
++// What a sub-agent says: streamed and sent whole like the agent's own text, under its parent.
++function subagentText(parent, text) {
++  const id = `msg_sub${++counter}`;
++  write({ type: "stream_event", event: { type: "message_start", message: { id, role: "assistant", content: [] } }, parent_tool_use_id: parent });
++  write({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, parent_tool_use_id: parent });
++  write({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }, parent_tool_use_id: parent });
++  write({ type: "assistant", message: { id, role: "assistant", content: [{ type: "text", text }] }, parent_tool_use_id: parent, uuid: `u-${++counter}` });
++}
++
++// The Task/Agent result: the sub-agent's reply, then the block Claude Code appends to it.
++const agentReply = (text, agentId) => [
++  { type: "text", text },
++  { type: "text", text: `agentId: ${agentId} (use SendMessage with to: '${agentId}' to continue this agent)\n<usage>total_tokens: 15021\ntool_uses: 2\nduration_ms: 9153</usage>` },
++];
++
+ const result = (extra = {}) => write({ type: "result", subtype: "success", is_error: false, duration_ms: 12, num_turns: 1, result: "", session_id: sessionId, queued_turn_count: 0, ...extra });
+ 
+ async function permission(name, input, suggestions) {
+@@ -125,6 +142,33 @@ async function runTurn(content) {
+     await assistantText(`msg_${++counter}`, "Done with the page.");
+     return result({ num_turns: 3 });
+   }
++  // Two sub-agents at once, one PyPI page each, their messages interleaved; a third one fails.
++  if (text.includes("[agents]")) {
++    const [a, b, c] = ["toolu_agent_a", "toolu_agent_b", "toolu_agent_c"];
++    toolUse(a, "Agent", { description: "Read requests on PyPI", prompt: "Open pypi.org/project/requests and report the version.", subagent_type: "general-purpose" });
++    toolUse(b, "Task", { description: "Read httpx on PyPI", prompt: "Open pypi.org/project/httpx and report the version.", subagent_type: "general-purpose" });
++    toolUse(c, "Agent", { description: "Read nothing", prompt: "Fail.", subagent_type: "general-purpose" });
++    for (const [parent, pkg] of [[a, "requests"], [b, "httpx"]]) write({ type: "user", message: { role: "user", content: [{ type: "text", text: `Open pypi.org/project/${pkg} and report the version.` }] }, parent_tool_use_id: parent });
++    toolUse("toolu_a_ts", "ToolSearch", { query: "select:mcp__firefox__tabs_create_mcp" }, a);
++    toolResult("toolu_a_ts", "loaded", false, a);
++    toolUse("toolu_a_tab", "mcp__firefox__tabs_create_mcp", {}, a);
++    toolUse("toolu_b_tab", "mcp__firefox__tabs_create_mcp", {}, b);
++    toolResult("toolu_b_tab", "Created tab 12", false, b);
++    toolResult("toolu_a_tab", "Created tab 11", false, a);
++    subagentText(a, "Opening the requests page now.");
++    toolUse("toolu_b_nav", "mcp__firefox__navigate", { url: "https://pypi.org/project/httpx/?utm=secret", tabId: 12 }, b);
++    toolUse("toolu_a_nav", "mcp__firefox__navigate", { url: "https://pypi.org/project/requests/", tabId: 11 }, a);
++    toolResult("toolu_a_nav", "Navigated to https://pypi.org/project/requests/\nTitle: requests", false, a);
++    toolResult("toolu_b_nav", "Navigated to https://pypi.org/project/httpx/\nTitle: httpx", false, b);
++    write({ type: "assistant", message: { id: "msg_sub_err", role: "assistant", model: "<synthetic>", content: [{ type: "text", text: "API Error: 529 overloaded" }] }, error: "unknown", isApiErrorMessage: true, parent_tool_use_id: c, uuid: "u-sub-err" });
++    subagentText(a, "requests 2.32.3");
++    toolResult(a, agentReply("requests 2.32.3", "a1b2c3d4e5f6a7b8c"));
++    subagentText(b, "httpx is at 0.28.1.");
++    toolResult(b, agentReply(`httpx 0.28.1\n\n${"The page lists every release. ".repeat(20)}`, "b1b2c3d4e5f6a7b8c"));
++    toolResult(c, [{ type: "text", text: "Agent failed: API Error: 529 overloaded\nmore detail" }], true);
++    await assistantText(`msg_${++counter}`, "requests is 2.32.3 and httpx is 0.28.1.");
++    return result({ num_turns: 4 });
++  }
+   if (text.includes("[perm]")) {
+     const input = { command: "touch fake-file", description: "Create a file" };
+     const decision = await permission("Bash", input);
+diff --git a/host/test/format.test.mjs b/host/test/format.test.mjs
+index 7d90ac2..705373e 100644
+--- a/host/test/format.test.mjs
++++ b/host/test/format.test.mjs
+@@ -60,6 +60,21 @@ test("tool results only carry text when they failed, plus a few harmless one-lin
+   assert.equal(summarizeToolResult("Bash", "", true), "Failed");
+ });
+ 
++test("a sub-agent step's result is its reply, without the block Claude Code appends, in 300 characters at most", () => {
++  const trailer = { type: "text", text: "agentId: a1b2c3 (use SendMessage with to: 'a1b2c3' to continue this agent)\n<usage>total_tokens: 15021\ntool_uses: 2\nduration_ms: 9153</usage>" };
++  for (const name of ["Task", "Agent"]) {
++    assert.equal(summarizeToolResult(name, [{ type: "text", text: "requests 2.32.3" }, trailer], false), "requests 2.32.3");
++    assert.equal(summarizeToolResult(name, "requests 2.32.3", false), "requests 2.32.3");
++    assert.equal(summarizeToolResult(name, [trailer], false), "");
++    assert.equal(summarizeToolResult(name, [{ type: "text", text: "y".repeat(500) }, trailer], false), `${"y".repeat(299)}…`);
++    assert.equal(summarizeToolResult(name, [{ type: "text", text: "Agent failed: overloaded\nstack" }, trailer], true), "Agent failed: overloaded");
++    assert.equal(summarizeToolResult(name, [trailer], true), "Failed");
++  }
++  assert.equal(summarizeToolResult("Agent", [{ type: "text", text: "agentId: is the field to use" }], false), "agentId: is the field to use", "only Claude Code's own block is dropped");
++  assert.equal(summarizeToolResult("Agent", [trailer, { type: "text", text: "the reply" }], false).endsWith("the reply"), true, "and only at the end");
++  assert.equal(summarizeToolResult("Read", [{ type: "text", text: "file body" }, trailer], false), "");
++});
++
+ test("errors map to the contract's codes", () => {
+   assert.equal(classifyError("You've hit your limit · resets 3pm (America/Los_Angeles)"), "limit");
+   assert.equal(classifyError("Claude AI usage limit reached|1790725800"), "limit");

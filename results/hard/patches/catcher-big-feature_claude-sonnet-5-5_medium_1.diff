@@ -1,0 +1,546 @@
+diff --git a/src/app.rs b/src/app.rs
+index c8e0cba..e1b4d9b 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -335,7 +335,7 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+             ("⌘A", "select all"),
+             ("⌥⌫", "delete the word before the cursor"),
+             ("⌘⌫", "delete to the start of the line"),
+-            ("tab", "indent (tab_width spaces)"),
++            ("tab", "indent (tab_width spaces); on a list item, nest it (⇧tab: back out)"),
+             (
+                 "tab / ⇧tab",
+                 "in a table: next / previous cell; past the last, a new row",
+diff --git a/src/editor.rs b/src/editor.rs
+index c3d3c6c..6379af3 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -6,6 +6,7 @@
+ //! live-preview view needs is here.
+ 
+ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++use std::collections::HashMap;
+ 
+ pub type Pos = (usize, usize);
+ 
+@@ -320,6 +321,21 @@ impl Editor {
+     /// Swap the selected rows (or the cursor row) with the line beyond them,
+     /// carrying the cursor and the selection along. False at either edge.
+     pub fn move_selected_lines(&mut self, down: bool) -> bool {
++        let (from, to) = self.selected_rows();
++        let pre = self.capture_lists(from, to);
++        if !self.move_selected_lines_raw(down) {
++            return false;
++        }
++        let (lo, hi) = if down {
++            (from, to + 1)
++        } else {
++            (from - 1, to)
++        };
++        self.renumber_lists(&pre, lo, hi);
++        true
++    }
++
++    fn move_selected_lines_raw(&mut self, down: bool) -> bool {
+         let (from, to) = self.selected_rows();
+         let can = if down {
+             to + 1 < self.lines.len()
+@@ -374,6 +390,10 @@ impl Editor {
+     }
+ 
+     pub fn delete_selection(&mut self) -> bool {
++        self.tracked(|e| e.delete_selection_raw())
++    }
++
++    fn delete_selection_raw(&mut self) -> bool {
+         if self.selection().is_none() {
+             return false;
+         }
+@@ -409,6 +429,10 @@ impl Editor {
+ 
+     /// Insert arbitrary text at the cursor, newlines and all (a paste).
+     pub fn insert_str(&mut self, text: &str) {
++        self.tracked(|e| e.insert_str_raw(text))
++    }
++
++    fn insert_str_raw(&mut self, text: &str) {
+         self.record(EditKind::Other);
+         self.batch += 1;
+         self.remove_selection();
+@@ -443,6 +467,10 @@ impl Editor {
+     /// so a double Enter ends the list. Anywhere but the end of a line this
+     /// is a plain newline.
+     pub fn insert_newline_continuing_list(&mut self) {
++        self.tracked(|e| e.insert_newline_continuing_list_raw())
++    }
++
++    fn insert_newline_continuing_list_raw(&mut self) {
+         let (row, col) = self.cursor;
+         if self.anchor.is_some() || col != self.line_len(row) {
+             self.insert_newline();
+@@ -452,6 +480,10 @@ impl Editor {
+             self.insert_newline();
+             return;
+         };
++        // a list numbered 1. 1. 1. on purpose carries its number on as it is
++        let flat = list_state(&self.lines, row)
++            .filter(|s| s.flat)
++            .and_then(|_| ordered(&self.lines[row]).map(|o| o.2));
+         self.record(EditKind::Other);
+         self.batch += 1;
+         if body_empty {
+@@ -462,11 +494,219 @@ impl Editor {
+             for c in prefix.chars() {
+                 self.insert_char(c);
+             }
++            if let Some(n) = flat {
++                self.set_number(row + 1, n);
++            }
+         }
+         self.batch -= 1;
+         self.last_kind = None;
+     }
+ 
++    /// What `tracked` and the move need to know about the lists around `from..=to`
++    /// before an edit, keyed by the row each list starts on.
++    fn capture_lists(&self, from: usize, to: usize) -> HashMap<usize, ListState> {
++        let last = self.lines.len().saturating_sub(1);
++        let mut out = HashMap::new();
++        for r in from.saturating_sub(1)..=(to + 1).min(last) {
++            if let Some(st) = list_state(&self.lines, r) {
++                out.insert(st.first, st);
++            }
++        }
++        out
++    }
++
++    /// Run an edit, then renumber the ordered lists it touched: the ones on
++    /// the rows from where it began to where the cursor ends up.
++    fn tracked<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
++        let (a, b) = match self.selection() {
++            Some(((sr, _), (er, _))) => (sr, er),
++            None => (self.cursor.0, self.cursor.0),
++        };
++        let pre = self.capture_lists(a, b);
++        let out = f(self);
++        let hi = self.cursor.0.max(a);
++        self.renumber_lists(&pre, a, hi);
++        out
++    }
++
++    /// Renumber every ordered list with an item on rows `from..=to`. A list
++    /// keeps the number it started on (as `pre` saw it), and one whose items
++    /// all carry the same number is left alone.
++    fn renumber_lists(&mut self, pre: &HashMap<usize, ListState>, from: usize, to: usize) {
++        let mut done = Vec::new();
++        for r in from..=to.min(self.lines.len().saturating_sub(1)) {
++            let Some(members) = list_block(&self.lines, r) else {
++                continue;
++            };
++            let first = members[0];
++            if done.contains(&first) {
++                continue;
++            }
++            done.push(first);
++            let p = pre.get(&first);
++            self.renumber_block(first, p.map(|s| s.start), p.map(|s| s.flat));
++        }
++    }
++
++    /// Number the list `row` is in from `start` (or from its first item's own
++    /// number) up, unless `flat` (or, unknown, the list as it is) numbers every
++    /// item the same.
++    fn renumber_block(&mut self, row: usize, start: Option<u64>, flat: Option<bool>) {
++        let Some(members) = list_block(&self.lines, row) else {
++            return;
++        };
++        let nums: Vec<u64> = members
++            .iter()
++            .filter_map(|&r| ordered(&self.lines[r]).map(|o| o.2))
++            .collect();
++        if flat.unwrap_or(nums.len() >= 2 && nums[0] == nums[1]) {
++            return;
++        }
++        let start = start.unwrap_or(nums[0]);
++        for (k, &r) in members.iter().enumerate() {
++            self.set_number(r, start + k as u64);
++        }
++    }
++
++    /// Rewrite the number of the ordered item on `row`, keeping the cursor and
++    /// anchor where they were in its text.
++    fn set_number(&mut self, row: usize, n: u64) {
++        let Some((ds, de, old, _)) = ordered(&self.lines[row]) else {
++            return;
++        };
++        if old == n {
++            return;
++        }
++        let text = n.to_string();
++        let line = &self.lines[row];
++        let cs = line[..ds].chars().count();
++        let ce = cs + line[ds..de].chars().count();
++        let delta = text.chars().count() as isize - (ce - cs) as isize;
++        self.lines[row].replace_range(ds..de, &text);
++        let fix = |p: &mut Pos| {
++            if p.0 == row && p.1 >= ce {
++                p.1 = p.1.saturating_add_signed(delta);
++            }
++        };
++        fix(&mut self.cursor);
++        if let Some(a) = self.anchor.as_mut() {
++            fix(a);
++        }
++    }
++
++    fn cursor_in_list_item(&self) -> bool {
++        self.lines.get(self.cursor.0).is_some_and(|l| is_item(l))
++    }
++
++    /// Tab / Shift+Tab on list items: nest the item (with whatever is under
++    /// it) one level under the item above, or bring it back out. False, and
++    /// nothing touched, when the cursor is not in a list item or the item
++    /// cannot move that way.
++    fn shift_items(&mut self, out: bool) -> bool {
++        if !self.cursor_in_list_item() {
++            return false;
++        }
++        let (from, to) = self.selected_rows();
++        let tops: Vec<usize> = {
++            let mut tops: Vec<usize> = Vec::new();
++            let mut reach = 0;
++            for r in from..=to {
++                if r < reach || !is_item(&self.lines[r]) {
++                    continue;
++                }
++                reach = subtree_end(&self.lines, r) + 1;
++                tops.push(r);
++            }
++            tops
++        };
++        let Some(&first) = tops.first() else {
++            return false;
++        };
++        let w = width(&self.lines[first]);
++        if out {
++            if w == 0 {
++                return false;
++            }
++        } else if !has_sibling_above(&self.lines, first) {
++            return false;
++        }
++        // the lists the items leave, as they stand now
++        let old: Vec<(Vec<usize>, ListState)> = tops
++            .iter()
++            .filter_map(|&t| Some((list_block(&self.lines, t)?, list_state(&self.lines, t)?)))
++            .collect();
++        let step = if out {
++            let l = &self.lines[first];
++            if l.starts_with('\t') {
++                4
++            } else {
++                l.chars().take_while(|&c| c == ' ').count().min(self.tab_width.max(1))
++            }
++        } else {
++            0
++        };
++        let tab = self.lines[first].starts_with('\t');
++        self.record(EditKind::Other);
++        let mut shifted = Vec::new();
++        for &t in &tops {
++            for r in t..=subtree_end(&self.lines, t) {
++                if self.lines[r].trim().is_empty() {
++                    continue;
++                }
++                let before = self.lines[r].chars().count();
++                if out {
++                    strip_width(&mut self.lines[r], step);
++                } else if tab {
++                    self.lines[r].insert(0, '\t');
++                } else {
++                    let pad = " ".repeat(self.tab_width.max(1));
++                    self.lines[r].insert_str(0, &pad);
++                }
++                let delta = self.lines[r].chars().count() as isize - before as isize;
++                let fix = |p: &mut Pos| {
++                    if p.0 == r {
++                        p.1 = p.1.saturating_add_signed(delta);
++                    }
++                };
++                fix(&mut self.cursor);
++                if let Some(a) = self.anchor.as_mut() {
++                    fix(a);
++                }
++                shifted.push(r);
++            }
++        }
++        // the list each item left closes up behind it, keeping its start
++        for (members, st) in &old {
++            let Some(&r) = members.iter().find(|r| !shifted.contains(r)) else {
++                continue;
++            };
++            let start = (r != members[0]).then_some(st.start);
++            self.renumber_block(r, start, Some(st.flat));
++        }
++        // and the list each joined takes it in; one it starts begins at 1
++        for &t in &tops {
++            if ordered(&self.lines[t]).is_none() {
++                continue;
++            }
++            let Some(members) = list_block(&self.lines, t) else {
++                continue;
++            };
++            let lead = members[0] == t;
++            // is the list it joined numbered the same throughout, without it?
++            let rest: Vec<u64> = members
++                .iter()
++                .filter(|r| !tops.contains(r))
++                .filter_map(|&r| ordered(&self.lines[r]).map(|o| o.2))
++                .collect();
++            let flat = rest.len() >= 2 && rest[0] == rest[1];
++            self.renumber_block(t, (lead && !out).then_some(1), Some(flat));
++        }
++        self.anchor = self.anchor.map(|a| self.clamp(a));
++        self.cursor = self.clamp(self.cursor);
++        self.last_kind = None;
++        true
++    }
++
+     /// Char range of the cluster the char at `col` belongs to, when that
+     /// cluster is a ZWJ sequence or a flag; `col..col + 1` otherwise.
+     fn cluster_at(&self, row: usize, col: usize) -> (usize, usize) {
+@@ -481,6 +721,10 @@ impl Editor {
+     }
+ 
+     pub fn backspace(&mut self) {
++        self.tracked(|e| e.backspace_raw())
++    }
++
++    fn backspace_raw(&mut self) {
+         self.record(EditKind::Delete);
+         if self.remove_selection() {
+             return;
+@@ -499,6 +743,10 @@ impl Editor {
+     }
+ 
+     pub fn delete_forward(&mut self) {
++        self.tracked(|e| e.delete_forward_raw())
++    }
++
++    fn delete_forward_raw(&mut self) {
+         self.record(EditKind::Delete);
+         if self.remove_selection() {
+             return;
+@@ -640,7 +888,19 @@ impl Editor {
+                 self.delete_forward();
+                 return true;
+             }
++            KeyCode::BackTab => {
++                return self.shift_items(true);
++            }
++            KeyCode::Tab if select => {
++                return self.shift_items(true);
++            }
+             KeyCode::Tab => {
++                if self.shift_items(false) {
++                    return true;
++                }
++                if self.cursor_in_list_item() {
++                    return false;
++                }
+                 for _ in 0..self.tab_width.max(1) {
+                     self.insert_char(' ');
+                 }
+@@ -785,6 +1045,139 @@ impl Editor {
+     }
+ }
+ 
++/// The number an ordered list was seen to start on, and whether it numbers
++/// every item the same.
++#[derive(Clone, Copy)]
++struct ListState {
++    first: usize,
++    start: u64,
++    flat: bool,
++}
++
++/// Columns of leading whitespace; a tab counts four.
++fn width(line: &str) -> usize {
++    line.chars()
++        .take_while(|c| matches!(c, ' ' | '\t'))
++        .map(|c| if c == '\t' { 4 } else { 1 })
++        .sum()
++}
++
++/// Bytes of the number, its end, its value and the `.` or `)` after it, for
++/// an ordered item.
++fn ordered(line: &str) -> Option<(usize, usize, u64, char)> {
++    let ds = line.len() - line.trim_start_matches([' ', '\t']).len();
++    let rest = &line[ds..];
++    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
++    if digits == 0 {
++        return None;
++    }
++    let punct = rest[digits..].chars().next().filter(|c| matches!(c, '.' | ')'))?;
++    if !rest[digits + 1..].starts_with(' ') {
++        return None;
++    }
++    let n = rest[..digits].parse().ok()?;
++    Some((ds, ds + digits, n, punct))
++}
++
++fn is_item(line: &str) -> bool {
++    let rest = line.trim_start_matches([' ', '\t']);
++    ordered(line).is_some() || ["- ", "* ", "+ "].iter().any(|m| rest.starts_with(m))
++}
++
++/// Rows of the ordered list `row` is an item of: items at its indent and with
++/// its delimiter, the rows under each (indented further) between them. A blank
++/// line or anything else at that indent ends the list.
++fn list_block(lines: &[String], row: usize) -> Option<Vec<usize>> {
++    let (_, _, _, p) = ordered(lines.get(row)?)?;
++    let w = width(&lines[row]);
++    let sibling = |l: &String| width(l) == w && ordered(l).is_some_and(|o| o.3 == p);
++    let mut members = vec![row];
++    let mut j = row;
++    while j > 0 {
++        j -= 1;
++        let l = &lines[j];
++        let lw = width(l);
++        if l.trim().is_empty() || lw < w {
++            break;
++        }
++        if lw == w {
++            if !sibling(l) {
++                break;
++            }
++            members.insert(0, j);
++        }
++    }
++    for (j, l) in lines.iter().enumerate().skip(row + 1) {
++        let lw = width(l);
++        if l.trim().is_empty() || lw < w {
++            break;
++        }
++        if lw == w {
++            if !sibling(l) {
++                break;
++            }
++            members.push(j);
++        }
++    }
++    Some(members)
++}
++
++fn list_state(lines: &[String], row: usize) -> Option<ListState> {
++    let members = list_block(lines, row)?;
++    let num = |r: usize| ordered(&lines[r]).map_or(0, |o| o.2);
++    Some(ListState {
++        first: members[0],
++        start: num(members[0]),
++        flat: members.len() >= 2 && num(members[0]) == num(members[1]),
++    })
++}
++
++/// Last row of the item on `row` and everything nested under it.
++fn subtree_end(lines: &[String], row: usize) -> usize {
++    let w = width(&lines[row]);
++    let mut end = row;
++    for (j, l) in lines.iter().enumerate().skip(row + 1) {
++        if l.trim().is_empty() {
++            continue;
++        }
++        if width(l) <= w {
++            break;
++        }
++        end = j;
++    }
++    end
++}
++
++/// Whether the item on `row` has an item above it at its own indent to nest
++/// under, with nothing but that item's own children between.
++fn has_sibling_above(lines: &[String], row: usize) -> bool {
++    let w = width(&lines[row]);
++    for l in lines[..row].iter().rev() {
++        let lw = width(l);
++        if l.trim().is_empty() || lw < w {
++            return false;
++        }
++        if lw == w {
++            return is_item(l);
++        }
++    }
++    false
++}
++
++/// Take about `cols` columns of leading whitespace off `line`.
++fn strip_width(line: &mut String, cols: usize) {
++    let mut taken = 0;
++    let mut bytes = 0;
++    for c in line.chars() {
++        if taken >= cols || !matches!(c, ' ' | '\t') {
++            break;
++        }
++        taken += if c == '\t' { 4 } else { 1 };
++        bytes += 1;
++    }
++    line.replace_range(..bytes, "");
++}
++
+ /// If `line` is a list item, the prefix its successor should start with and
+ /// whether the item has no text after its marker.
+ fn list_continuation(line: &str) -> Option<(String, bool)> {
+@@ -834,6 +1227,52 @@ mod tests {
+         Editor::new("one\ntwo\nthree")
+     }
+ 
++    #[test]
++    fn paste_renumbers_the_list() {
++        let mut e = Editor::new("6. a\n7. b");
++        e.set_cursor((1, 4));
++        e.insert_str("\n1. c\n2. d\n3. e");
++        assert_eq!(e.text(), "6. a\n7. b\n8. c\n9. d\n10. e");
++    }
++
++    #[test]
++    fn enter_delete_and_move_renumber() {
++        let mut e = Editor::new("1. a\n2. b\n3. c");
++        e.set_cursor((0, 4));
++        e.insert_newline_continuing_list();
++        e.insert_str("x");
++        assert_eq!(e.text(), "1. a\n2. x\n3. b\n4. c");
++        e.set_cursor((1, 0));
++        e.anchor = Some((2, 0));
++        e.delete_selection();
++        assert_eq!(e.text(), "1. a\n2. b\n3. c");
++        e.set_cursor((0, 0));
++        assert!(e.move_selected_lines(true));
++        assert_eq!(e.text(), "1. b\n2. a\n3. c");
++    }
++
++    #[test]
++    fn flat_and_other_lists_are_left() {
++        let mut e = Editor::new("1. a\n1. b\n1. c\n\ntext\n\n5. x\n9. y");
++        e.set_cursor((0, 4));
++        e.insert_newline_continuing_list();
++        assert_eq!(e.text(), "1. a\n1. \n1. b\n1. c\n\ntext\n\n5. x\n9. y");
++    }
++
++    #[test]
++    fn tab_nests_with_children_and_shift_tab_returns() {
++        let mut e = Editor::new("1. a\n2. b\n   1. b1\n3. c");
++        e.set_cursor((1, 4));
++        e.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
++        assert_eq!(e.text(), "1. a\n  1. b\n     1. b1\n2. c");
++        assert_eq!(e.cursor, (1, 6));
++        e.on_key(key(KeyCode::BackTab, KeyModifiers::NONE));
++        assert_eq!(e.text(), "1. a\n2. b\n   1. b1\n3. c");
++        e.set_cursor((0, 0));
++        assert!(!e.on_key(key(KeyCode::Tab, KeyModifiers::NONE)));
++        assert_eq!(e.text(), "1. a\n2. b\n   1. b1\n3. c");
++    }
++
+     #[test]
+     fn joined_clusters_move_and_delete_as_one() {
+         for cluster in [

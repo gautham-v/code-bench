@@ -1,0 +1,263 @@
+diff --git a/src/app.rs b/src/app.rs
+index 016bc69..5aba201 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -638,6 +638,8 @@ impl App {
+     /// Rebuild the line → row mapping from the buffer and the note's folds.
+     fn refresh_visible(&mut self) {
+         let blocks = self.blocks();
++        self.folds
++            .settle(&self.notes[self.active].path, self.editor.lines(), &blocks);
+         let folded = self.folds.of(&self.notes[self.active].path);
+         self.visible = crate::fold::Visible::new(self.editor.lines(), &blocks, &folded);
+     }
+@@ -852,6 +854,7 @@ impl App {
+                 // just typed turn up in the footer of the note it names
+                 self.mentions.invalidate();
+                 if now != path {
++                    self.folds.rename(&path, &now);
+                     if let Some(done) = self.update_links(&path, &now) {
+                         self.flash(format!("renamed · {done}"));
+                     }
+@@ -930,6 +933,7 @@ impl App {
+             return;
+         }
+         self.editor.replace_all(&self.notes[self.active].content);
++        self.refresh_visible();
+         self.dirty = false;
+         self.mentions.invalidate();
+         self.flash(if dropped {
+@@ -1083,6 +1087,9 @@ impl App {
+         // read, so whatever it says is no longer wanted
+         self.index_rx = None;
+         self.refresh_links();
++        if self.contents {
++            self.load_bodies();
++        }
+     }
+ 
+     /// The same walk, on a thread, for the one caller that must not wait for
+@@ -1111,6 +1118,9 @@ impl App {
+                 self.open_index = entries;
+                 self.index_rx = None;
+                 self.refresh_links();
++                if self.contents {
++                    self.load_bodies();
++                }
+             }
+             Err(std::sync::mpsc::TryRecvError::Empty) => {}
+             // only a panic in the walk can do this; there is nothing to wait
+@@ -1484,10 +1494,23 @@ impl App {
+     fn enter_contents(&mut self) {
+         self.contents = true;
+         self.selected = 0;
++        self.load_bodies();
++    }
++
++    /// Read a body per `open_index` entry. A note open in the session is
++    /// searched as it stands in the buffer, which is what a hit will land in.
++    fn load_bodies(&mut self) {
++        self.sync_editor_to_note();
+         self.contents_bodies = self
+             .open_index
+             .iter()
+-            .map(|e| crate::contents::body_of(&e.path))
++            .map(|e| {
++                let open = self.notes.iter().find(|n| n.path == e.path);
++                match open {
++                    Some(n) => Some(n.content.clone()),
++                    None => crate::contents::body_of(&e.path),
++                }
++            })
+             .collect();
+     }
+ 
+@@ -1510,6 +1533,7 @@ impl App {
+         };
+         self.open_path(&path);
+         self.editor.set_cursor((line, 0));
++        self.reveal_cursor();
+         self.preview_goto = Some(line);
+     }
+ 
+@@ -1880,8 +1904,10 @@ impl App {
+     /// if the folder already has one by that name); the title is untouched.
+     fn commit_move(&mut self, dir: &Path) {
+         let label = self.move_label(dir);
++        let old = self.notes[self.active].path.clone();
+         match notes::move_file(&mut self.notes[self.active], dir) {
+             Ok(path) => {
++                self.folds.rename(&old, &path);
+                 let name = path
+                     .file_name()
+                     .map(|n| n.to_string_lossy().into_owned())
+@@ -1923,6 +1949,9 @@ impl App {
+                     .file_name()
+                     .map(|n| n.to_string_lossy().into_owned())
+                     .unwrap_or_default();
++                if path != old {
++                    self.folds.rename(&old, &path);
++                }
+                 let done = if path != old {
+                     self.update_links(&old, &path)
+                 } else {
+@@ -2498,6 +2527,9 @@ impl App {
+             self.toggle_checkbox(row);
+             return;
+         }
++        if self.toggle_fold_at_preview(x, y) {
++            return;
++        }
+         if self.config.preview_click == PreviewClick::Edit {
+             self.edit_at_preview(x, y);
+             return;
+@@ -2506,6 +2538,34 @@ impl App {
+         self.preview_dragging = true;
+     }
+ 
++    /// A click on a heading in the reading view folds or unfolds it.
++    fn toggle_fold_at_preview(&mut self, x: u16, y: u16) -> bool {
++        let at = ratatui::layout::Position { x, y };
++        let Some(row) = self
++            .preview_rows
++            .iter()
++            .find(|(r, _, _)| r.contains(at))
++            .and_then(|(_, row, _)| *row)
++        else {
++            return false;
++        };
++        let blocks = self.blocks();
++        if crate::fold::heading_at(self.editor.lines(), &blocks, row).is_none() {
++            return false;
++        }
++        let path = self.notes[self.active].path.clone();
++        if !self.folds.unfold(&path, row)
++            && self
++                .folds
++                .fold(&path, self.editor.lines(), &blocks, row)
++                .is_none()
++        {
++            return false;
++        }
++        self.refresh_visible();
++        true
++    }
++
+     /// The old behaviour, kept behind `preview_click: edit`: land in the
+     /// editor at the spot that was clicked.
+     fn edit_at_preview(&mut self, x: u16, y: u16) {
+diff --git a/src/config.rs b/src/config.rs
+index 9bdd706..b11b396 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -277,9 +277,9 @@ impl Config {
+                 .ok()
+                 .and_then(|p| fs::read_to_string(p).ok())
+                 .unwrap_or_default();
+-            let migrated = Config::from_str(&seed);
+-            write_settings(&path, &migrated)?;
+-            return Ok(migrated);
++            // the file records what is configured, never a one-off CATCHER_DIR
++            write_settings(&path, &Config::parse(&seed, false))?;
++            return Ok(Config::from_str(&seed));
+         }
+         let text =
+             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+@@ -289,7 +289,7 @@ impl Config {
+         // not have. Rewriting is safe because the document is generated from
+         // the config the file was just parsed into: every value survives.
+         if !covers_every_setting(&text, &config) {
+-            let _ = write_settings(&path, &config);
++            let _ = write_settings(&path, &Config::parse(&text, false));
+         }
+         Ok(config)
+     }
+@@ -305,6 +305,12 @@ impl Config {
+ 
+     #[allow(clippy::should_implement_trait)]
+     pub fn from_str(text: &str) -> Config {
++        Config::parse(text, true)
++    }
++
++    /// `from_str`, with the environment's say over `notes_dir` optional: the
++    /// settings file is written from a parse that ignores it.
++    fn parse(text: &str, env: bool) -> Config {
+         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+         let mut c = Config::default();
+ 
+@@ -313,8 +319,9 @@ impl Config {
+             c.attachments_dir = c.notes_dir.join("attachments");
+         }
+         // the environment wins: it is how a one-off session is pointed elsewhere
+-        if let Some(d) =
+-            std::env::var_os("CATCHER_DIR").or_else(|| std::env::var_os("TINYNOTE_DIR"))
++        if let Some(d) = std::env::var_os("CATCHER_DIR")
++            .or_else(|| std::env::var_os("TINYNOTE_DIR"))
++            .filter(|_| env)
+         {
+             c.notes_dir = PathBuf::from(d);
+             c.attachments_dir = c.notes_dir.join("attachments");
+diff --git a/src/fold.rs b/src/fold.rs
+index 3b6380d..a5e8ba1 100644
+--- a/src/fold.rs
++++ b/src/fold.rs
+@@ -96,6 +96,16 @@ impl Folds {
+         Some(to + 1 - from)
+     }
+ 
++    /// The note at `old` now lives at `new`: its folds go with it.
++    pub fn rename(&mut self, old: &Path, new: &Path) {
++        if old == new {
++            return;
++        }
++        if let Some(m) = self.by_note.remove(old) {
++            self.by_note.insert(new.to_path_buf(), m);
++        }
++    }
++
+     /// Open the fold on `row`. Whether there was one.
+     pub fn unfold(&mut self, path: &Path, row: usize) -> bool {
+         let Some(m) = self.by_note.get_mut(path) else {
+diff --git a/src/md.rs b/src/md.rs
+index 931078c..12c94bb 100644
+--- a/src/md.rs
++++ b/src/md.rs
+@@ -1239,6 +1239,15 @@ pub fn tags_in(line: &str) -> Vec<(usize, usize)> {
+                 }
+             }
+             '[' => {
++                if src.get(i + 1) == Some(&'[') {
++                    // a [[wikilink]] is a link, and its `#Heading` is no tag
++                    if let Some(close) = (i + 2..src.len().saturating_sub(1))
++                        .find(|&k| src[k] == ']' && src[k + 1] == ']')
++                    {
++                        i = close + 2;
++                        continue;
++                    }
++                }
+                 if let Some(close) = find(&src, i + 1, ']') {
+                     if src.get(close + 1) == Some(&'(') {
+                         if let Some(paren) = find(&src, close + 2, ')') {
+diff --git a/src/ui.rs b/src/ui.rs
+index 3f74bd3..db3bf7e 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -270,6 +270,18 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+         .map_or((0, 0), |r| (r.end, content[..r.end].lines().count()));
+     let mut rendered =
+         crate::render::render_page_at(&content[skip..], first, width, app.config.table_style);
++    // a fold hides its lines here as it does in the editor; a row the
++    // renderer invented (a spacer) goes with the section it sits in
++    if !app.visible.is_plain() {
++        let mut hiding = false;
++        rendered.lines.retain(|l| match l.src_line {
++            Some(n) => {
++                hiding = app.visible.is_hidden(n);
++                !hiding
++            }
++            None => !hiding,
++        });
++    }
+     // the footer arrives a frame or two late by design: the scan behind it
+     // reads every note body under the roots, and a page that waited for that
+     // would be a page that stuttered on every open

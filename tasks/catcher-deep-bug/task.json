@@ -1,0 +1,68 @@
+{
+  "id": "catcher-deep-bug",
+  "set": "hard",
+  "repo": "catcher",
+  "base": "84f3c9fafe01374043f2fa2b45ee1ecccd077f49",
+  "fix": "49852c4a39c553b31ba8fce212998d4f0c977573",
+  "kind": "bug",
+  "prompt": "The branches I merged for the next release trip over each other, folding most of all:\n\n- When my vault's sync rewrites a note I have open with sections folded, the editor comes back with the wrong lines hidden. The sections I folded should still be the folded ones.\n- Folds are forgotten when the note's file is renamed or moved.\n- The reading view ignores folds. It should show them the way the editor does, and a click on a heading there should fold or unfold it.\n- Enter on a search-in-all-files hit doesn't always put me on the line it showed: sometimes a different line, sometimes one I can't see.\n- Following #setup lists my install guide too. It has no tags, only [[#Setup]] links to its own heading.\n- After one `CATCHER_DIR=/tmp/demo catcher` run, my settings.md had /tmp/demo as its notes_dir.\n\nTrack these down and fix them.",
+  "clone": [],
+  "env": {
+    "CARGO_TARGET_DIR": "{root}/target",
+    "CARGO_NET_OFFLINE": "true"
+  },
+  "warm": "cargo test --no-run",
+  "protected": [],
+  "checks": [
+    {
+      "name": "existing_tests_pass",
+      "cmd": "bash heldout-check.sh existing",
+      "expect_base": "pass"
+    },
+    {
+      "name": "folds_follow_outside_edit",
+      "cmd": "bash heldout-check.sh outside_edit_folds",
+      "expect_base": "fail"
+    },
+    {
+      "name": "cursor_on_screen_after_outside_edit",
+      "cmd": "bash heldout-check.sh outside_edit_cursor",
+      "expect_base": "fail"
+    },
+    {
+      "name": "folds_follow_renamed_or_moved_file",
+      "cmd": "bash heldout-check.sh file_moves_folds",
+      "expect_base": "fail"
+    },
+    {
+      "name": "reading_view_has_the_folds",
+      "cmd": "bash heldout-check.sh reading_view_folds",
+      "expect_base": "fail"
+    },
+    {
+      "name": "search_hit_in_fold_is_shown",
+      "cmd": "bash heldout-check.sh search_hit_in_fold",
+      "expect_base": "fail"
+    },
+    {
+      "name": "search_hit_matches_unsaved_buffer",
+      "cmd": "bash heldout-check.sh search_hit_unsaved",
+      "expect_base": "fail"
+    },
+    {
+      "name": "search_hit_gone_keeps_cursor",
+      "cmd": "bash heldout-check.sh search_hit_gone",
+      "expect_base": "fail"
+    },
+    {
+      "name": "heading_link_is_not_a_tag",
+      "cmd": "bash heldout-check.sh heading_link_not_tag",
+      "expect_base": "fail"
+    },
+    {
+      "name": "env_dir_not_written_to_settings",
+      "cmd": "bash heldout-check.sh env_dir_not_saved",
+      "expect_base": "fail"
+    }
+  ]
+}

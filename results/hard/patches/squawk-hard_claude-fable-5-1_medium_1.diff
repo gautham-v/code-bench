@@ -1,0 +1,2431 @@
+diff --git a/crates/squawk-core/src/context/detect.rs b/crates/squawk-core/src/context/detect.rs
+new file mode 100644
+index 0000000..7909096
+--- /dev/null
++++ b/crates/squawk-core/src/context/detect.rs
+@@ -0,0 +1,462 @@
++//! Finding the agent session behind the front terminal.
++//!
++//! The process table is read with libproc; nothing is spawned. The choice
++//! between several sessions ([`choose`]) and the test for "is this process an
++//! agent" ([`agent_for`]) are pure, so they are tested without a terminal.
++
++use std::path::{Path, PathBuf};
++use std::time::SystemTime;
++
++use super::{Agent, FrontApp, Session, AGENT_PROCESS_NAMES};
++
++/// Programs that run an agent as a script: the agent is their first argument.
++const INTERPRETERS: &[&str] = &["node", "bun", "deno", "sh", "bash", "zsh"];
++
++/// Where the agents' packages live on disk, for installs whose process name
++/// and script name say nothing (`node …/claude-code/cli.js`).
++const AGENT_PATH_MARKS: &[(&str, Agent)] = &[
++    ("/claude-code/", Agent::Claude),
++    ("/claude/versions/", Agent::Claude),
++    ("/@openai/codex/", Agent::Codex),
++];
++
++/// One agent process under the front terminal.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) struct Candidate {
++    pub session: Session,
++    /// Generations below the terminal's process.
++    pub depth: usize,
++    /// When the tty last took input, then when it last showed output.
++    pub tty_used: Option<(SystemTime, SystemTime)>,
++}
++
++/// Which agent a process is, from its name and arguments.
++///
++/// The name alone decides for a native binary (`claude`, `codex`). An npm
++/// install runs as `node /…/bin/claude`, and the native Claude Code binary
++/// is a file named after its version, started with `argv[0] = "claude"`; both
++/// are recognised from the arguments.
++pub(super) fn agent_for(name: &str, exe: &str, argv: &[String]) -> Option<Agent> {
++    let named = |s: &str| {
++        AGENT_PROCESS_NAMES
++            .iter()
++            .find(|(n, _)| *n == s)
++            .map(|(_, a)| *a)
++    };
++    let marked = |path: &str| {
++        AGENT_PATH_MARKS
++            .iter()
++            .find(|(mark, _)| path.contains(mark))
++            .map(|(_, a)| *a)
++    };
++    let arg0 = argv.first().map(|a| base_name(a)).unwrap_or("");
++    if let Some(agent) = named(name).or_else(|| named(arg0)) {
++        return Some(agent);
++    }
++    if INTERPRETERS.contains(&name) || INTERPRETERS.contains(&arg0) {
++        // The script is the first argument that is not a flag.
++        let script = argv.iter().skip(1).find(|a| !a.starts_with('-'))?;
++        let stem = base_name(script);
++        let stem = stem
++            .strip_suffix(".js")
++            .or_else(|| stem.strip_suffix(".mjs"))
++            .or_else(|| stem.strip_suffix(".cjs"))
++            .unwrap_or(stem);
++        return named(stem).or_else(|| marked(script));
++    }
++    marked(exe)
++}
++
++fn base_name(path: &str) -> &str {
++    path.rsplit('/').next().unwrap_or(path)
++}
++
++/// The session a dictation is meant for: the one whose terminal was typed
++/// into (or focused) last, then the one that printed last; within one tty,
++/// the outermost agent.
++pub(super) fn choose(mut candidates: Vec<Candidate>) -> Option<Session> {
++    candidates.sort_by(|a, b| {
++        b.tty_used
++            .cmp(&a.tty_used)
++            .then(a.depth.cmp(&b.depth))
++            .then(a.session.pid.cmp(&b.session.pid))
++    });
++    candidates.into_iter().next().map(|c| c.session)
++}
++
++/// When the tty device was last read and last written.
++fn tty_used(tty: &Path) -> Option<(SystemTime, SystemTime)> {
++    let meta = std::fs::metadata(tty).ok()?;
++    Some((meta.accessed().ok()?, meta.modified().ok()?))
++}
++
++#[cfg(target_os = "macos")]
++pub(super) fn detect(front: &FrontApp) -> Option<Session> {
++    use std::collections::HashMap;
++
++    if !super::is_terminal(&front.bundle_id) || front.pid <= 0 {
++        return None;
++    }
++    let procs: Vec<sys::Proc> = sys::pids().into_iter().filter_map(sys::info).collect();
++    let mut children: HashMap<i32, Vec<&sys::Proc>> = HashMap::new();
++    for p in &procs {
++        children.entry(p.ppid).or_default().push(p);
++    }
++
++    // The terminal's own process, plus iTerm2's session servers: they hold
++    // its shells but are re-parented to launchd.
++    let mut queue: Vec<(i32, usize)> = vec![(front.pid, 0)];
++    if front.bundle_id == "com.googlecode.iterm2" {
++        queue.extend(
++            procs
++                .iter()
++                .filter(|p| p.name.starts_with("iTermServer"))
++                .map(|p| (p.pid, 0)),
++        );
++    }
++
++    let mut candidates = Vec::new();
++    let mut seen = std::collections::HashSet::new();
++    while let Some((pid, depth)) = queue.pop() {
++        if !seen.insert(pid) {
++            continue;
++        }
++        for p in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
++            if p.pid == pid {
++                continue;
++            }
++            queue.push((p.pid, depth + 1));
++            let Some(agent) = sys::agent(p) else { continue };
++            let Some(cwd) = sys::cwd(p.pid) else { continue };
++            let tty = p.tdev.and_then(sys::tty_path);
++            candidates.push(Candidate {
++                tty_used: tty.as_deref().and_then(tty_used),
++                depth: depth + 1,
++                session: Session {
++                    agent,
++                    pid: p.pid,
++                    cwd,
++                    tty,
++                },
++            });
++        }
++    }
++    choose(candidates)
++}
++
++#[cfg(not(target_os = "macos"))]
++pub(super) fn detect(front: &FrontApp) -> Option<Session> {
++    let _ = (front, tty_used as fn(&Path) -> _);
++    None
++}
++
++/// The libproc and sysctl calls.
++#[cfg(target_os = "macos")]
++mod sys {
++    use std::ffi::{CStr, OsStr};
++    use std::mem;
++    use std::os::unix::ffi::OsStrExt;
++
++    use super::{agent_for, Agent, PathBuf};
++
++    pub struct Proc {
++        pub pid: i32,
++        pub ppid: i32,
++        pub name: String,
++        /// The controlling terminal's device, when there is one.
++        pub tdev: Option<u32>,
++    }
++
++    pub fn pids() -> Vec<i32> {
++        // SAFETY: a null buffer asks for the count only.
++        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
++        if count <= 0 {
++            return Vec::new();
++        }
++        // Room for processes started between the two calls.
++        let mut pids = vec![0 as libc::pid_t; count as usize + 64];
++        let bytes = (pids.len() * mem::size_of::<libc::pid_t>()) as libc::c_int;
++        // SAFETY: the buffer is `bytes` long and written as pid_t values.
++        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
++        pids.truncate(count.max(0) as usize);
++        pids.retain(|pid| *pid > 0);
++        pids
++    }
++
++    pub fn info(pid: i32) -> Option<Proc> {
++        // SAFETY: proc_bsdinfo is plain data; zero is a valid value for it.
++        let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
++        let size = mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
++        // SAFETY: the buffer is a proc_bsdinfo of exactly `size` bytes.
++        let written = unsafe {
++            libc::proc_pidinfo(
++                pid,
++                libc::PROC_PIDTBSDINFO,
++                0,
++                (&mut info as *mut libc::proc_bsdinfo).cast(),
++                size,
++            )
++        };
++        if written != size {
++            return None;
++        }
++        // pbi_name is the longer of the two; it is empty for some processes.
++        let name = match c_chars(&info.pbi_name) {
++            name if name.is_empty() => c_chars(&info.pbi_comm),
++            name => name,
++        };
++        Some(Proc {
++            pid,
++            ppid: info.pbi_ppid as i32,
++            name,
++            tdev: Some(info.e_tdev).filter(|dev| *dev != 0 && *dev != u32::MAX),
++        })
++    }
++
++    pub fn agent(p: &Proc) -> Option<Agent> {
++        if let Some(agent) = agent_for(&p.name, "", &[]) {
++            return Some(agent);
++        }
++        let (exe, argv) = args(p.pid)?;
++        agent_for(&p.name, &exe, &argv)
++    }
++
++    pub fn cwd(pid: i32) -> Option<PathBuf> {
++        // SAFETY: proc_vnodepathinfo is plain data; zero is a valid value.
++        let mut info: libc::proc_vnodepathinfo = unsafe { mem::zeroed() };
++        let size = mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
++        // SAFETY: the buffer is a proc_vnodepathinfo of exactly `size` bytes.
++        let written = unsafe {
++            libc::proc_pidinfo(
++                pid,
++                libc::PROC_PIDVNODEPATHINFO,
++                0,
++                (&mut info as *mut libc::proc_vnodepathinfo).cast(),
++                size,
++            )
++        };
++        if written != size {
++            return None;
++        }
++        let path: Vec<u8> = info
++            .pvi_cdir
++            .vip_path
++            .iter()
++            .flatten()
++            .map(|c| *c as u8)
++            .take_while(|b| *b != 0)
++            .collect();
++        if path.is_empty() {
++            return None;
++        }
++        Some(PathBuf::from(OsStr::from_bytes(&path)))
++    }
++
++    pub fn tty_path(dev: u32) -> Option<PathBuf> {
++        // SAFETY: devname returns null or a NUL-terminated name in static
++        // storage, copied before anything else can call it.
++        let name = unsafe {
++            let name = libc::devname(dev as libc::dev_t, libc::S_IFCHR);
++            if name.is_null() {
++                return None;
++            }
++            CStr::from_ptr(name).to_string_lossy().into_owned()
++        };
++        // devname answers "??" for a device it does not know.
++        if name.is_empty() || name.contains('?') {
++            return None;
++        }
++        Some(PathBuf::from("/dev").join(name))
++    }
++
++    /// The executable path and arguments of a process of the same user
++    /// (KERN_PROCARGS2: argc, the path, padding, then the arguments).
++    fn args(pid: i32) -> Option<(String, Vec<String>)> {
++        let mut argmax: libc::c_int = 0;
++        let mut size: libc::size_t = mem::size_of::<libc::c_int>();
++        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
++        // SAFETY: `argmax` is a c_int and `size` is its size.
++        let rc = unsafe {
++            libc::sysctl(
++                mib.as_mut_ptr(),
++                mib.len() as libc::c_uint,
++                (&mut argmax as *mut libc::c_int).cast(),
++                &mut size,
++                std::ptr::null_mut(),
++                0,
++            )
++        };
++        if rc != 0 || argmax <= 0 {
++            return None;
++        }
++        let mut buf = vec![0u8; argmax as usize];
++        let mut size = buf.len() as libc::size_t;
++        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
++        // SAFETY: the kernel writes at most `size` bytes into `buf`.
++        let rc = unsafe {
++            libc::sysctl(
++                mib.as_mut_ptr(),
++                mib.len() as libc::c_uint,
++                buf.as_mut_ptr().cast(),
++                &mut size,
++                std::ptr::null_mut(),
++                0,
++            )
++        };
++        if rc != 0 || size < mem::size_of::<libc::c_int>() {
++            return None;
++        }
++        buf.truncate(size);
++        let (argc, rest) = buf.split_at(mem::size_of::<libc::c_int>());
++        let argc = libc::c_int::from_ne_bytes(argc.try_into().ok()?);
++        let exe_end = rest.iter().position(|b| *b == 0)?;
++        let exe = String::from_utf8_lossy(&rest[..exe_end]).into_owned();
++        let argv = rest[exe_end..]
++            .split(|b| *b == 0)
++            .skip_while(|s| s.is_empty())
++            .take(argc.max(0) as usize)
++            .map(|s| String::from_utf8_lossy(s).into_owned())
++            .collect();
++        Some((exe, argv))
++    }
++
++    fn c_chars(chars: &[libc::c_char]) -> String {
++        let bytes: Vec<u8> = chars
++            .iter()
++            .map(|c| *c as u8)
++            .take_while(|b| *b != 0)
++            .collect();
++        String::from_utf8_lossy(&bytes).into_owned()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn args(list: &[&str]) -> Vec<String> {
++        list.iter().map(|s| s.to_string()).collect()
++    }
++
++    #[test]
++    fn agents_by_name_and_arguments() {
++        assert_eq!(agent_for("claude", "", &[]), Some(Agent::Claude));
++        assert_eq!(agent_for("codex", "", &[]), Some(Agent::Codex));
++        // The native build: a binary named after its version.
++        assert_eq!(
++            agent_for(
++                "2.0.14",
++                "/Users/you/.local/share/claude/versions/2.0.14",
++                &args(&["claude", "--continue"])
++            ),
++            Some(Agent::Claude)
++        );
++        // npm installs run under node.
++        assert_eq!(
++            agent_for(
++                "node",
++                "/opt/homebrew/bin/node",
++                &args(&["node", "/opt/homebrew/bin/claude"])
++            ),
++            Some(Agent::Claude)
++        );
++        assert_eq!(
++            agent_for(
++                "node",
++                "/usr/local/bin/node",
++                &args(&[
++                    "node",
++                    "--no-warnings",
++                    "/usr/local/lib/node_modules/@openai/codex/bin/codex.js"
++                ])
++            ),
++            Some(Agent::Codex)
++        );
++    }
++
++    #[test]
++    fn other_processes_are_not_agents() {
++        assert_eq!(agent_for("zsh", "/bin/zsh", &args(&["-zsh"])), None);
++        assert_eq!(
++            agent_for("vim", "/usr/bin/vim", &args(&["vim", "claude"])),
++            None
++        );
++        assert_eq!(
++            agent_for("node", "/usr/bin/node", &args(&["node", "server.js"])),
++            None
++        );
++        assert_eq!(agent_for("claude-helper", "", &[]), None);
++    }
++
++    fn candidate(pid: i32, depth: usize, used: Option<(u64, u64)>) -> Candidate {
++        let at = |secs| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
++        Candidate {
++            session: Session {
++                agent: Agent::Claude,
++                pid,
++                cwd: PathBuf::from("/tmp"),
++                tty: None,
++            },
++            depth,
++            tty_used: used.map(|(read, written)| (at(read), at(written))),
++        }
++    }
++
++    #[test]
++    fn the_most_recently_used_tty_wins() {
++        assert_eq!(choose(Vec::new()), None);
++        // Input beats output: a background tab that is printing is not the
++        // one being talked to.
++        let picked = choose(vec![
++            candidate(10, 2, Some((100, 900))),
++            candidate(20, 2, Some((500, 500))),
++            candidate(30, 2, None),
++        ]);
++        assert_eq!(picked.map(|s| s.pid), Some(20));
++        // Same tty: the outer agent.
++        let picked = choose(vec![
++            candidate(11, 4, Some((7, 7))),
++            candidate(12, 2, Some((7, 7))),
++        ]);
++        assert_eq!(picked.map(|s| s.pid), Some(12));
++    }
++
++    #[test]
++    fn only_terminals_are_searched() {
++        let front = FrontApp {
++            bundle_id: "com.apple.Safari".into(),
++            name: "Safari".into(),
++            pid: std::process::id() as i32,
++        };
++        assert_eq!(detect(&front), None);
++    }
++
++    /// A process named `claude` under this one is found, with its directory.
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn finds_an_agent_under_the_front_process() {
++        let dir = tempfile::tempdir().unwrap();
++        let bin = dir.path().join("claude");
++        std::fs::copy("/bin/sleep", &bin).unwrap();
++        let work = dir.path().join("project");
++        std::fs::create_dir(&work).unwrap();
++        let mut child = std::process::Command::new(&bin)
++            .arg("30")
++            .current_dir(&work)
++            .spawn()
++            .unwrap();
++        let front = FrontApp {
++            bundle_id: "com.mitchellh.ghostty".into(),
++            name: "Ghostty".into(),
++            pid: std::process::id() as i32,
++        };
++        let found = detect(&front);
++        child.kill().unwrap();
++        child.wait().unwrap();
++        let session = found.expect("the child is an agent");
++        assert_eq!(session.agent, Agent::Claude);
++        assert_eq!(session.pid, child.id() as i32);
++        assert_eq!(session.cwd, work.canonicalize().unwrap());
++        assert_eq!(session.project(), "project");
++    }
++}
+diff --git a/crates/squawk-core/src/context/mentions.rs b/crates/squawk-core/src/context/mentions.rs
+new file mode 100644
+index 0000000..50afa19
+--- /dev/null
++++ b/crates/squawk-core/src/context/mentions.rs
+@@ -0,0 +1,873 @@
++//! Rewriting a transcript with a repo's vocab: spoken file names become
++//! @mentions, and the repo's terms get the repo's spelling.
++//!
++//! A file is referred to by its whole name with its extension: "status item
++//! dot rs", or without the "dot" for extensions that are not also words
++//! ("cargo toml"). Words are compared with separators and case removed, so
++//! `status_item.rs`, `StatusItem.rs` and `status-item.rs` are all said the
++//! same way, and "hot key dot rs" finds `hotkey.rs`. When several files share
++//! the name, a folder said before it ("context slash mod dot rs") picks one;
++//! a name that still fits more than one file is left as spoken.
++//!
++//! A term is rewritten when it is heard whole: the word itself in any case,
++//! or its parts as separate words ("vocab cache" for `VocabCache`, "squawk
++//! core" for `squawk-core`). A term that is only a file's name is not
++//! rewritten from its parts: "the status item" stays prose, and is reached
++//! as a file by saying its extension.
++
++use std::collections::{HashMap, HashSet};
++use std::sync::{Arc, Mutex};
++
++use super::vocab::file_stem;
++use super::RepoVocab;
++use crate::text::{self, Chunk};
++
++/// Extensions that can be said without "dot": abbreviations nobody says
++/// after a file's name by accident. Words do need it ("go", "mod", "lock"),
++/// and so do language names ("the main java class" is not `Main.java`).
++const DOTLESS_EXTS: &[&str] = &[
++    "md", "toml", "json", "yaml", "yml", "rs", "py", "ts", "tsx", "js", "jsx", "txt", "html",
++    "css", "scss", "sh", "sql", "kt", "rb", "cpp", "hpp", "cs", "xml", "csv", "plist",
++];
++/// Whole names said without "dot" although their extension is a word.
++const DOTLESS_NAMES: &[&str] = &[
++    "cargo.lock",
++    "yarn.lock",
++    "gemfile.lock",
++    "poetry.lock",
++    "flake.lock",
++];
++/// How an extension can be heard after "dot".
++const EXT_ALIASES: &[(&str, &str)] = &[
++    ("markdown", "md"),
++    ("jason", "json"),
++    ("python", "py"),
++    ("pie", "py"),
++    ("text", "txt"),
++    ("javascript", "js"),
++    ("typescript", "ts"),
++    ("yammel", "yaml"),
++    ("shell", "sh"),
++    ("rust", "rs"),
++];
++/// Separators said aloud inside a name: "status underscore item".
++const SEPARATOR_WORDS: &[&str] = &["underscore", "dash", "hyphen"];
++const NUMBER_WORDS: &[&str] = &[
++    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
++];
++
++/// A file or folder name is at most this many spoken words.
++const MAX_NAME_WORDS: usize = 6;
++/// An extension spelled out letter by letter: "t s x".
++const MAX_EXT_WORDS: usize = 3;
++/// A term's parts are tried in every grouping up to this many parts.
++const MAX_GROUPED_PARTS: usize = 5;
++const MAX_TERM_WORDS: usize = 8;
++
++/// A vocab arranged for lookup. Built once per vocab (see [`index_for`]).
++#[derive(Debug, Default)]
++pub(super) struct Index {
++    /// Spoken name (`statusitem.rs`) → the files called that.
++    names: HashMap<String, Vec<u32>>,
++    /// Every last extension in `names`.
++    exts: HashSet<String>,
++    /// Spoken form (`vocab cache`) → the term.
++    terms: HashMap<String, Term>,
++    /// The longest spoken form, in words.
++    max_term_words: usize,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum Term {
++    Written {
++        written: String,
++        /// Only rewritten when heard as one word (a file's stem).
++        one_word_only: bool,
++    },
++    /// Two terms are said this way; neither is written.
++    Ambiguous,
++}
++
++/// The index for a vocab, built on first use and kept for the few vocabs
++/// most recently used, so `apply` never pays for it after a warm-up.
++pub(super) fn index_for(vocab: &Arc<RepoVocab>) -> Arc<Index> {
++    const KEPT: usize = 4;
++    static RECENT: Mutex<Vec<(Arc<RepoVocab>, Arc<Index>)>> = Mutex::new(Vec::new());
++    let find = |recent: &Vec<(Arc<RepoVocab>, Arc<Index>)>| {
++        recent
++            .iter()
++            .find(|(v, _)| Arc::ptr_eq(v, vocab))
++            .map(|(_, index)| index.clone())
++    };
++    if let Some(index) = find(&RECENT.lock().unwrap_or_else(|e| e.into_inner())) {
++        return index;
++    }
++    let index = Arc::new(Index::new(vocab));
++    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(index) = find(&recent) {
++        return index;
++    }
++    // Holding the vocab keeps its address from being reused by another.
++    recent.insert(0, (vocab.clone(), index.clone()));
++    recent.truncate(KEPT);
++    index
++}
++
++impl Index {
++    pub(super) fn new(vocab: &RepoVocab) -> Index {
++        let mut index = Index::default();
++        let mut stems: HashSet<&str> = HashSet::new();
++        for (i, file) in vocab.files.iter().enumerate() {
++            stems.extend(file_stem(file));
++            // A path with a space cannot be one @mention.
++            if file.is_empty() || file.contains(char::is_whitespace) {
++                continue;
++            }
++            let name = file.rsplit('/').next().unwrap_or(file);
++            if let Some(key) = name_key(name) {
++                if let Some((_, ext)) = key.rsplit_once('.') {
++                    index.exts.insert(ext.to_string());
++                }
++                index.names.entry(key).or_default().push(i as u32);
++            }
++        }
++
++        // The repo's names first; a file stem never displaces one.
++        let (stem_words, names): (Vec<&String>, Vec<&String>) =
++            vocab.words.iter().partition(|w| stems.contains(w.as_str()));
++        for word in names {
++            let Some(parts) = term_parts(word) else {
++                continue;
++            };
++            // A lowercase word has no spelling to restore.
++            if parts.len() == 1 && !word.chars().any(char::is_uppercase) {
++                continue;
++            }
++            for form in groupings(&parts) {
++                index.max_term_words = index.max_term_words.max(form.split(' ').count());
++                let term = Term::Written {
++                    written: word.clone(),
++                    one_word_only: false,
++                };
++                index
++                    .terms
++                    .entry(form)
++                    .and_modify(|t| {
++                        if *t != term {
++                            *t = Term::Ambiguous;
++                        }
++                    })
++                    .or_insert(term);
++            }
++        }
++        for word in stem_words {
++            let Some(parts) = term_parts(word).filter(|p| p.len() > 1) else {
++                continue;
++            };
++            for form in [parts.concat(), parts.join(" ")] {
++                index.terms.entry(form).or_insert(Term::Written {
++                    written: word.clone(),
++                    one_word_only: true,
++                });
++            }
++        }
++        index.max_term_words = index.max_term_words.clamp(1, MAX_TERM_WORDS);
++        index
++    }
++}
++
++pub(super) fn apply(text: &str, vocab: &RepoVocab, index: &Index) -> String {
++    let mut chunks = text::chunks(text);
++    let mentioned = mention_files(&mut chunks, vocab, index);
++    let spelled = spell_terms(&mut chunks, index);
++    if mentioned || spelled {
++        text::join(&chunks)
++    } else {
++        text.to_string()
++    }
++}
++
++// ------------------------------------------------------------- mentions --
++
++/// Letters and digits only, lowercased: how a name is compared.
++fn squash(s: &str) -> String {
++    s.chars()
++        .filter(|c| c.is_alphanumeric())
++        .flat_map(char::to_lowercase)
++        .collect()
++}
++
++/// `status_item.rs` → `statusitem.rs`, `.gitignore` → `.gitignore`,
++/// `foo.test.ts` → `foo.test.ts`. `None` for a name with no extension.
++fn name_key(name: &str) -> Option<String> {
++    let segments: Vec<String> = name.split('.').map(squash).collect();
++    let dotfile = name.starts_with('.');
++    if segments.len() < 2 || segments.iter().skip(dotfile as usize).any(String::is_empty) {
++        return None;
++    }
++    Some(segments.join("."))
++}
++
++/// A chunk that can be part of a spoken name: an ordinary word.
++fn is_plain(chunk: &Chunk) -> bool {
++    !chunk.is_protected() && chunk.core.chars().any(char::is_alphanumeric)
++}
++
++/// A plain chunk that is exactly this word, with nothing attached after it.
++fn is_word(chunk: &Chunk, word: &str) -> bool {
++    is_plain(chunk) && chunk.trail.is_empty() && chunk.key() == word
++}
++
++/// The ways `chunks[start..end]` can be read as one name: as heard, and with
++/// spoken separators dropped and number words as digits.
++fn spoken(chunks: &[Chunk]) -> Vec<String> {
++    let raw: String = chunks.iter().map(|c| squash(&c.core)).collect();
++    let cooked: String = chunks
++        .iter()
++        .map(|c| {
++            let key = c.key();
++            if SEPARATOR_WORDS.contains(&key.as_str()) {
++                String::new()
++            } else if let Some(n) = NUMBER_WORDS.iter().position(|w| *w == key) {
++                n.to_string()
++            } else {
++                squash(&c.core)
++            }
++        })
++        .collect();
++    if cooked == raw || cooked.is_empty() {
++        vec![raw]
++    } else {
++        vec![raw, cooked]
++    }
++}
++
++/// How many chunks before `end` can be name words: each plain, nothing
++/// between them but spaces, and no "dot" or "slash" among them.
++fn name_words_before(chunks: &[Chunk], end: usize) -> usize {
++    let mut n = 0;
++    while n < MAX_NAME_WORDS && n < end {
++        let c = &chunks[end - 1 - n];
++        let attached = !c.trail.is_empty() || (n > 0 && !chunks[end - n].lead.is_empty());
++        if !is_plain(c) || attached || matches!(c.key().as_str(), "dot" | "slash") {
++            break;
++        }
++        n += 1;
++    }
++    n
++}
++
++/// What can follow the "dot" at `dot`: (end of the reference, the rest of the
++/// name key from that dot on). Longest first.
++fn after_dot(chunks: &[Chunk], dot: usize, depth: usize) -> Vec<(usize, String)> {
++    let mut out = Vec::new();
++    for n in 1..=MAX_EXT_WORDS {
++        let end = dot + 1 + n;
++        if end > chunks.len() {
++            break;
++        }
++        let words = &chunks[dot + 1..end];
++        let joined = words
++            .iter()
++            .enumerate()
++            .all(|(i, c)| is_plain(c) && c.lead.is_empty() && (i + 1 == n || c.trail.is_empty()));
++        if !joined {
++            break;
++        }
++        let mut segments = spoken(words);
++        if n == 1 {
++            let key = words[0].key();
++            segments.extend(
++                EXT_ALIASES
++                    .iter()
++                    .filter(|(heard, _)| *heard == key)
++                    .map(|(_, ext)| ext.to_string()),
++            );
++        }
++        for segment in segments {
++            // "app dot test dot ts": another dot, another segment.
++            let more = depth < 3 && words[n - 1].trail.is_empty();
++            if more && chunks.get(end).is_some_and(is_dot) {
++                for (far, rest) in after_dot(chunks, end, depth + 1) {
++                    out.push((far, format!(".{segment}{rest}")));
++                }
++            }
++            out.push((end, format!(".{segment}")));
++        }
++    }
++    out.sort_by_key(|form| std::cmp::Reverse(form.0));
++    out
++}
++
++fn is_dot(chunk: &Chunk) -> bool {
++    chunk.lead.is_empty() && is_word(chunk, "dot")
++}
++
++fn is_slash(chunk: &Chunk) -> bool {
++    chunk.lead.is_empty() && is_word(chunk, "slash")
++}
++
++/// A reference found in the chunks: `chunks[start..end]` names these files.
++struct Found<'a> {
++    start: usize,
++    end: usize,
++    files: &'a [u32],
++}
++
++/// "… status item dot rs": the name before the "dot" at `dot` and the
++/// extension after it. The longest name that is a file's wins.
++fn dotted<'a>(chunks: &[Chunk], dot: usize, index: &'a Index) -> Option<Found<'a>> {
++    let before = name_words_before(chunks, dot);
++    for (end, rest) in after_dot(chunks, dot, 0) {
++        for n in (1..=before).rev() {
++            for stem in spoken(&chunks[dot - n..dot]) {
++                if let Some(files) = index.names.get(&format!("{stem}{rest}")) {
++                    return Some(Found {
++                        start: dot - n,
++                        end,
++                        files,
++                    });
++                }
++            }
++        }
++        // "dot gitignore": a dotfile is its extension.
++        if let Some(files) = index.names.get(&rest) {
++            return Some(Found {
++                start: dot,
++                end,
++                files,
++            });
++        }
++    }
++    None
++}
++
++/// "… cargo toml": the chunk at `at` is an extension said without "dot".
++fn dotless<'a>(chunks: &[Chunk], at: usize, index: &'a Index) -> Option<Found<'a>> {
++    let ext = chunks[at].key();
++    if !is_plain(&chunks[at]) || !chunks[at].lead.is_empty() || !index.exts.contains(&ext) {
++        return None;
++    }
++    for n in (1..=name_words_before(chunks, at)).rev() {
++        for stem in spoken(&chunks[at - n..at]) {
++            let key = format!("{stem}.{ext}");
++            if !DOTLESS_EXTS.contains(&ext.as_str()) && !DOTLESS_NAMES.contains(&key.as_str()) {
++                continue;
++            }
++            if let Some(files) = index.names.get(&key) {
++                return Some(Found {
++                    start: at - n,
++                    end: at + 1,
++                    files,
++                });
++            }
++        }
++    }
++    None
++}
++
++/// Folders said before the name at `start`, checked against `path`'s own:
++/// "core slash src slash" fits `…/core/src/<name>`. Returns where the
++/// folders start and whether they spell the whole path, or `None` when a
++/// folder was said that this path does not have.
++fn folders_before(chunks: &[Chunk], start: usize, path: &str) -> Option<(usize, bool)> {
++    let mut dirs: Vec<&str> = path.split('/').collect();
++    dirs.pop();
++    let mut pos = start;
++    while pos > 0 && is_slash(&chunks[pos - 1]) && chunks[pos].lead.is_empty() {
++        let dir = squash(dirs.pop()?);
++        let slash = pos - 1;
++        let n = (1..=name_words_before(chunks, slash))
++            .find(|n| spoken(&chunks[slash - n..slash]).contains(&dir))?;
++        pos = slash - n;
++    }
++    Some((pos, dirs.is_empty()))
++}
++
++/// The one file a reference means, and where the reference starts once any
++/// folders said before it are counted in. `None` when it is not certain.
++fn resolve(chunks: &[Chunk], found: &Found, vocab: &RepoVocab) -> Option<(usize, u32)> {
++    let path = |i: u32| vocab.files[i as usize].as_str();
++    let said_folder = found.start > 0 && is_slash(&chunks[found.start - 1]);
++    if !said_folder {
++        return match found.files {
++            [only] => Some((found.start, *only)),
++            // The name alone is the path of the file at the top.
++            files => {
++                let mut top = files.iter().filter(|i| !path(**i).contains('/'));
++                match (top.next(), top.next()) {
++                    (Some(only), None) => Some((found.start, *only)),
++                    _ => None,
++                }
++            }
++        };
++    }
++    let fits: Vec<(usize, bool, u32)> = found
++        .files
++        .iter()
++        .filter_map(|i| {
++            let (start, whole) = folders_before(chunks, found.start, path(*i))?;
++            Some((start, whole, *i))
++        })
++        .collect();
++    // The file that accounts for the most folders said; among equals, the
++    // one whose whole path was said.
++    let longest = fits.iter().map(|(start, ..)| *start).min()?;
++    let best: Vec<_> = fits.iter().filter(|(s, ..)| *s == longest).collect();
++    match best.as_slice() {
++        [(start, _, file)] => Some((*start, *file)),
++        several => {
++            let mut whole = several.iter().filter(|(_, whole, _)| *whole);
++            match (whole.next(), whole.next()) {
++                (Some((start, _, file)), None) => Some((*start, *file)),
++                _ => None,
++            }
++        }
++    }
++}
++
++fn mention_files(chunks: &mut Vec<Chunk>, vocab: &RepoVocab, index: &Index) -> bool {
++    if index.names.is_empty() {
++        return false;
++    }
++    let mut changed = false;
++    let mut i = 0;
++    while i < chunks.len() {
++        let found = if is_dot(&chunks[i]) {
++            dotted(chunks, i, index)
++        } else if i > 0 && !is_dot(&chunks[i - 1]) {
++            dotless(chunks, i, index)
++        } else {
++            None
++        };
++        let Some((mut start, file)) = found
++            .as_ref()
++            .and_then(|found| resolve(chunks, found, vocab))
++        else {
++            i += 1;
++            continue;
++        };
++        let end = found.expect("resolved").end;
++        // "the claude md" is the file, not "the" file; "the claude md file"
++        // keeps its article.
++        let article = start > 0
++            && chunks[start].lead.is_empty()
++            && is_word(&chunks[start - 1], "the")
++            && !chunks
++                .get(end)
++                .is_some_and(|c| matches!(c.key().as_str(), "file" | "files"));
++        if article {
++            start -= 1;
++        }
++        let mut trail = chunks[end - 1].trail.clone();
++        // Ending the dictation: a period there would read as part of the path.
++        if end == chunks.len() && trail == "." {
++            trail.clear();
++        }
++        let mention = Chunk {
++            lead: chunks[start].lead.clone(),
++            core: format!("@{}", vocab.files[file as usize]),
++            trail,
++        };
++        chunks.splice(start..end, [mention]);
++        changed = true;
++        i = start + 1;
++    }
++    changed
++}
++
++// ---------------------------------------------------------------- terms --
++
++/// The parts a term is said in: `VocabCache` → vocab, cache; `squawk-core`
++/// → squawk, core; `gpt5` → gpt, 5; `Claude Code` → claude, code. `None`
++/// for a term with characters that are never said.
++fn term_parts(word: &str) -> Option<Vec<String>> {
++    let chars: Vec<char> = word.chars().collect();
++    let mut parts: Vec<String> = Vec::new();
++    let mut cur = String::new();
++    for (i, &c) in chars.iter().enumerate() {
++        if matches!(c, ' ' | '-' | '_' | '.') {
++            if !cur.is_empty() {
++                parts.push(std::mem::take(&mut cur));
++            }
++            continue;
++        }
++        if !c.is_alphanumeric() {
++            return None;
++        }
++        if let Some(&p) = i.checked_sub(1).and_then(|j| chars.get(j)) {
++            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
++            // The camel-case rule the dictionary uses: `SQLite` → SQ, Lite.
++            let boundary = (p.is_lowercase() && c.is_uppercase())
++                || (p.is_uppercase() && c.is_uppercase() && next_lower)
++                || (p.is_alphanumeric() && p.is_ascii_digit() != c.is_ascii_digit());
++            if boundary && !cur.is_empty() {
++                parts.push(std::mem::take(&mut cur));
++            }
++        }
++        cur.extend(c.to_lowercase());
++    }
++    if !cur.is_empty() {
++        parts.push(cur);
++    }
++    (!parts.is_empty()).then_some(parts)
++}
++
++/// Every way of saying the parts as words: each gap is a space or nothing.
++/// Long terms get only the two extremes.
++fn groupings(parts: &[String]) -> Vec<String> {
++    if parts.len() > MAX_GROUPED_PARTS {
++        return vec![parts.concat(), parts.join(" ")];
++    }
++    let gaps = parts.len() - 1;
++    (0..1u32 << gaps)
++        .map(|mask| {
++            let mut form = parts[0].clone();
++            for (gap, part) in parts[1..].iter().enumerate() {
++                if mask & (1 << gap) != 0 {
++                    form.push(' ');
++                }
++                form.push_str(part);
++            }
++            form
++        })
++        .collect()
++}
++
++/// How a heard chunk is looked up: lowercased, hyphens and underscores as
++/// spaces. `None` if it holds anything else that is not a letter or digit.
++fn heard(core: &str) -> Option<String> {
++    let mut out = String::new();
++    for c in core.chars() {
++        if c.is_alphanumeric() {
++            out.extend(c.to_lowercase());
++        } else if matches!(c, '-' | '_') {
++            out.push(' ');
++        } else {
++            return None;
++        }
++    }
++    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
++    (!out.is_empty()).then_some(out)
++}
++
++fn spell_terms(chunks: &mut Vec<Chunk>, index: &Index) -> bool {
++    if index.terms.is_empty() {
++        return false;
++    }
++    let mut changed = false;
++    let mut i = 0;
++    'next: while i < chunks.len() {
++        // How far a term starting here could run: unprotected words with
++        // nothing but spaces between them.
++        let mut reach = 0;
++        while reach < index.max_term_words && i + reach < chunks.len() {
++            let c = &chunks[i + reach];
++            if c.is_protected() || (reach > 0 && !c.lead.is_empty()) {
++                break;
++            }
++            reach += 1;
++            if !c.trail.is_empty() {
++                break;
++            }
++        }
++        for len in (1..=reach).rev() {
++            let last = &chunks[i + len - 1];
++            // "Parakeet's": the term, then the possessive.
++            let (last_core, possessive) = ["'s", "’s"]
++                .iter()
++                .find_map(|s| Some((last.core.strip_suffix(s)?, *s)))
++                .unwrap_or((&last.core, ""));
++            let cores = chunks[i..i + len - 1]
++                .iter()
++                .map(|c| c.core.as_str())
++                .chain([last_core]);
++            let Some(forms) = cores.map(heard).collect::<Option<Vec<_>>>() else {
++                continue;
++            };
++            let Some(Term::Written {
++                written,
++                one_word_only,
++            }) = index.terms.get(&forms.join(" "))
++            else {
++                continue;
++            };
++            if *one_word_only && len > 1 {
++                continue;
++            }
++            let core = format!("{written}{possessive}");
++            let as_heard = chunks[i..i + len]
++                .iter()
++                .map(|c| c.core.as_str())
++                .collect::<Vec<_>>()
++                .join(" ");
++            if core != as_heard {
++                let term = Chunk {
++                    lead: chunks[i].lead.clone(),
++                    core,
++                    trail: chunks[i + len - 1].trail.clone(),
++                };
++                chunks.splice(i..i + len, [term]);
++                changed = true;
++            } else {
++                // Already written the repo's way; its words are spoken for.
++                i += len - 1;
++            }
++            i += 1;
++            continue 'next;
++        }
++        i += 1;
++    }
++    changed
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn vocab(files: &[&str], words: &[&str]) -> RepoVocab {
++        RepoVocab {
++            root: "/repo".into(),
++            files: files.iter().map(|s| s.to_string()).collect(),
++            words: words.iter().map(|s| s.to_string()).collect(),
++        }
++    }
++
++    fn run(text: &str, vocab: &RepoVocab) -> String {
++        apply(text, vocab, &Index::new(vocab))
++    }
++
++    fn squawk() -> RepoVocab {
++        vocab(
++            &[
++                ".gitignore",
++                "CLAUDE.md",
++                "Cargo.lock",
++                "Cargo.toml",
++                "README.md",
++                "crates/squawk-app/Cargo.toml",
++                "crates/squawk-app/src/main.rs",
++                "crates/squawk-app/src/status_item.rs",
++                "crates/squawk-app/src/ui/mod.rs",
++                "crates/squawk-cli/src/main.rs",
++                "crates/squawk-cli/src/tui/mod.rs",
++                "crates/squawk-core/src/context/mod.rs",
++                "crates/squawk-core/src/hotkey.rs",
++                "crates/squawk-core/src/store/mod.rs",
++                "crates/squawk-engine/src/audio.rs",
++                "crates/squawk-engine/src/system_audio.rs",
++                "web/app.test.ts",
++                "web/go.mod",
++            ],
++            &[
++                "CLAUDE",
++                "Cargo",
++                "Claude Code",
++                "NVIDIA",
++                "Parakeet",
++                "README",
++                "VocabCache",
++                "audio",
++                "hotkey",
++                "macOS",
++                "main",
++                "mod",
++                "squawk",
++                "squawk-core",
++                "status_item",
++                "system_audio",
++            ],
++        )
++    }
++
++    #[test]
++    fn a_spoken_file_name_becomes_a_mention() {
++        let v = squawk();
++        assert_eq!(
++            run("take a look at status item dot rs", &v),
++            "take a look at @crates/squawk-app/src/status_item.rs"
++        );
++        assert_eq!(
++            run("Status item dot RS is broken.", &v),
++            "@crates/squawk-app/src/status_item.rs is broken."
++        );
++        // The longest name wins: system_audio.rs, not "system" + audio.rs.
++        assert_eq!(
++            run("open system audio dot rs, then audio dot rs", &v),
++            "open @crates/squawk-engine/src/system_audio.rs, then @crates/squawk-engine/src/audio.rs"
++        );
++        // However the model split the words.
++        assert_eq!(
++            run("fix hot key dot rs", &v),
++            "fix @crates/squawk-core/src/hotkey.rs"
++        );
++        assert_eq!(
++            run("fix status underscore item dot r s", &v),
++            "fix @crates/squawk-app/src/status_item.rs"
++        );
++    }
++
++    #[test]
++    fn extensions_that_are_not_words_need_no_dot() {
++        let v = squawk();
++        assert_eq!(run("update the claude md", &v), "update @CLAUDE.md");
++        assert_eq!(
++            run("update the claude md file please", &v),
++            "update the @CLAUDE.md file please"
++        );
++        assert_eq!(run("check cargo lock", &v), "check @Cargo.lock");
++        assert_eq!(run("the readme dot markdown", &v), "@README.md");
++        // "mod" is a word: "go mod tidy" is a command, not a file.
++        assert_eq!(run("run go mod tidy", &v), "run go mod tidy");
++        assert_eq!(run("open go dot mod", &v), "open @web/go.mod");
++    }
++
++    #[test]
++    fn dotfiles_and_double_extensions() {
++        let v = squawk();
++        assert_eq!(run("add it to dot gitignore", &v), "add it to @.gitignore");
++        assert_eq!(
++            run("add it to dot git ignore.", &v),
++            "add it to @.gitignore"
++        );
++        assert_eq!(
++            run("run app dot test dot ts again", &v),
++            "run @web/app.test.ts again"
++        );
++    }
++
++    #[test]
++    fn a_shared_name_needs_its_folder() {
++        let v = squawk();
++        assert_eq!(run("open mod dot rs", &v), "open mod dot rs");
++        assert_eq!(run("open main dot rs", &v), "open main dot rs");
++        assert_eq!(
++            run("open context slash mod dot rs", &v),
++            "open @crates/squawk-core/src/context/mod.rs"
++        );
++        assert_eq!(
++            run("open squawk cli slash src slash main dot rs", &v),
++            "open @crates/squawk-cli/src/main.rs"
++        );
++        // Both main.rs files are in a "src".
++        assert_eq!(
++            run("open src slash main dot rs", &v),
++            "open src slash main dot rs"
++        );
++        // A folder the file is not in: not sure, so nothing.
++        assert_eq!(
++            run("open engine slash status item dot rs", &v),
++            "open engine slash status item dot rs"
++        );
++        // The file at the top is the one a bare name means.
++        assert_eq!(run("bump cargo toml", &v), "bump @Cargo.toml");
++        assert_eq!(
++            run("bump squawk app slash cargo toml", &v),
++            "bump @crates/squawk-app/Cargo.toml"
++        );
++    }
++
++    #[test]
++    fn whole_path_said_beats_a_longer_one() {
++        let v = vocab(&["context/mod.rs", "old/context/mod.rs", "ui/mod.rs"], &[]);
++        assert_eq!(
++            run("see context slash mod dot rs", &v),
++            "see @context/mod.rs"
++        );
++        assert_eq!(
++            run("see old slash context slash mod dot rs", &v),
++            "see @old/context/mod.rs"
++        );
++    }
++
++    #[test]
++    fn unsure_means_untouched() {
++        let v = squawk();
++        for text in [
++            "the status item is broken",
++            "the audio is clipping",
++            "item dot rs",
++            "missing dot rs",
++            "status item, dot rs",
++            "connect the dot",
++            "open `status item dot rs`",
++            "see src/status_item.rs and @README.md",
++            "status item.rs",
++            "my file dot rs",
++        ] {
++            assert_eq!(run(text, &v), text, "{text}");
++        }
++        let spaced = vocab(&["my file.rs"], &[]);
++        assert_eq!(run("open my file dot rs", &spaced), "open my file dot rs");
++    }
++
++    #[test]
++    fn terms_get_the_repos_spelling() {
++        let v = squawk();
++        assert_eq!(
++            run("the vocab cache in squawk core", &v),
++            "the VocabCache in squawk-core"
++        );
++        assert_eq!(
++            run("Vocabcache, parakeet's model and nvidia on Mac OS.", &v),
++            "VocabCache, Parakeet's model and NVIDIA on macOS."
++        );
++        assert_eq!(run("ask claude code", &v), "ask Claude Code");
++        // Already right, or not a term at all.
++        assert_eq!(run("ask Claude Code", &v), "ask Claude Code");
++        assert_eq!(run("ask claude", &v), "ask claude");
++        // A file's name is not a term: these stay prose.
++        assert_eq!(run("Cargo build the readme", &v), "Cargo build the readme");
++        assert_eq!(
++            run("Main thing: system audio", &v),
++            "Main thing: system audio"
++        );
++        // Punctuation between the words: two words, not one term.
++        assert_eq!(run("vocab, cache", &v), "vocab, cache");
++        assert_eq!(run("see vocab_cache.rs", &v), "see vocab_cache.rs");
++    }
++
++    #[test]
++    fn two_terms_said_alike_are_left_alone() {
++        let v = vocab(&[], &["GitHub", "Github", "DataStore", "data_store"]);
++        assert_eq!(run("push to github", &v), "push to github");
++        assert_eq!(run("the data store", &v), "the data store");
++        // A file stem gives way to a real name.
++        let v = vocab(&["src/vocab_cache.rs"], &["VocabCache", "vocab_cache"]);
++        assert_eq!(run("the vocab cache", &v), "the VocabCache");
++    }
++
++    #[test]
++    fn untouched_text_is_returned_as_given() {
++        let v = squawk();
++        assert_eq!(run("two  spaces\tand a tab", &v), "two  spaces\tand a tab");
++        assert_eq!(run("", &v), "");
++        let empty = RepoVocab::default();
++        assert_eq!(run("status item dot rs", &empty), "status item dot rs");
++    }
++
++    #[test]
++    fn parts() {
++        let parts = |w| term_parts(w).unwrap().join(" ");
++        assert_eq!(parts("VocabCache"), "vocab cache");
++        assert_eq!(parts("squawk-core"), "squawk core");
++        assert_eq!(parts("SQLite"), "sq lite");
++        assert_eq!(parts("gpt5"), "gpt 5");
++        assert_eq!(parts("Claude Code"), "claude code");
++        assert_eq!(term_parts("C++"), None);
++        assert_eq!(
++            groupings(&["a".into(), "b".into(), "c".into()]),
++            ["abc", "a bc", "ab c", "a b c"]
++        );
++    }
++
++    #[test]
++    fn index_is_built_once_per_vocab() {
++        let v = Arc::new(squawk());
++        let a = index_for(&v);
++        let b = index_for(&v);
++        assert!(Arc::ptr_eq(&a, &b));
++        let other = Arc::new(squawk());
++        assert!(!Arc::ptr_eq(&a, &index_for(&other)));
++    }
++}
+diff --git a/crates/squawk-core/src/context/mod.rs b/crates/squawk-core/src/context/mod.rs
+index 0978faa..bdc4156 100644
+--- a/crates/squawk-core/src/context/mod.rs
++++ b/crates/squawk-core/src/context/mod.rs
+@@ -2,11 +2,9 @@
+ //! `codex`), find that session's working directory and use the repo to fix
+ //! what the model heard.
+ //!
+-//! OWNED BY THE CONTEXT AGENT. This file holds the agreed public API with
+-//! stub bodies (detection finds nothing, `apply` passes text through) so the
+-//! rest of the workspace builds against it. See SPEC.md, "squawk-core::context".
+-//! The implementation may split into submodules (detect.rs, vocab.rs,
+-//! mentions.rs); the items below must stay exported from `context`.
++//! - `detect.rs` finds the session: the agent process under the terminal;
++//! - `vocab.rs` reads the repo: its files and the words it writes its own way;
++//! - `mentions.rs` rewrites the transcript with them.
+ //!
+ //! Timing contract: the app calls [`detect`] and [`VocabCache::get`] when a
+ //! recording *starts* (off the main thread, while the user is still talking),
+@@ -14,8 +12,13 @@
+ //! `detect` + a warm `get` under 20 ms; a cold `get` (first time in a repo)
+ //! may take longer but must stay under ~200 ms on a large repo.
+ 
++mod detect;
++mod mentions;
++mod vocab;
++
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
++use std::time::Instant;
+ 
+ /// Terminal apps squawk knows, by bundle id.
+ pub const TERMINAL_BUNDLE_IDS: &[&str] = &[
+@@ -84,11 +87,8 @@ pub fn is_terminal(bundle_id: &str) -> bool {
+ /// tty was used most recently (tty device atime/mtime). `None` if the front
+ /// app is not a terminal or runs no agent. Uses libproc (proc_listpids,
+ /// proc_pidinfo PROC_PIDTBSDINFO / PROC_PIDVNODEPATHINFO); no subprocesses.
+-///
+-/// STUB: always `None`.
+ pub fn detect(front: &FrontApp) -> Option<Session> {
+-    let _ = front;
+-    None
++    detect::detect(front)
+ }
+ 
+ /// What a repo offers for fixing a transcript.
+@@ -96,8 +96,8 @@ pub fn detect(front: &FrontApp) -> Option<Session> {
+ pub struct RepoVocab {
+     /// The directory mentions are relative to (the session cwd).
+     pub root: PathBuf,
+-    /// Tracked files, relative to `root` (`src/audio.rs`), from `git ls-files`
+-    /// (or a bounded walk outside git).
++    /// Files, relative to `root` (`src/audio.rs`): in a git repo the tracked
++    /// ones plus new ones git does not ignore, otherwise a bounded walk.
+     pub files: Vec<String>,
+     /// Jargon in its canonical casing: file stems, crate/package names,
+     /// headings and capitalised terms from README.md / CLAUDE.md / CONTEXT.md.
+@@ -105,21 +105,27 @@ pub struct RepoVocab {
+ }
+ 
+ impl RepoVocab {
+-    /// Scan the repo at `cwd`. STUB: empty vocab rooted at `cwd`.
++    /// Scan the repo at `cwd`. A directory that cannot be read gives an
++    /// empty vocab rooted at `cwd`.
+     pub fn build(cwd: &Path) -> RepoVocab {
+-        RepoVocab {
+-            root: cwd.to_path_buf(),
+-            ..RepoVocab::default()
+-        }
++        vocab::build(cwd)
+     }
+ }
+ 
+-/// Per-cwd vocab, rebuilt when the repo's `.git/index` mtime changes (or,
+-/// outside git, after a short TTL). Owned by the app's dictation controller;
+-/// not shared between threads.
++/// Per-cwd vocab, rebuilt when the repo's `.git/index` changes or a file
++/// appears in the directory itself, and otherwise after a short TTL (new
++/// files deeper down are only seen by looking). Owned by the app's dictation
++/// controller; not shared between threads.
+ #[derive(Debug, Default)]
+ pub struct VocabCache {
+-    entries: std::collections::HashMap<PathBuf, Arc<RepoVocab>>,
++    entries: std::collections::HashMap<PathBuf, CachedVocab>,
++}
++
++#[derive(Debug)]
++struct CachedVocab {
++    vocab: Arc<RepoVocab>,
++    stamp: vocab::Stamp,
++    built: Instant,
+ }
+ 
+ impl VocabCache {
+@@ -127,11 +133,29 @@ impl VocabCache {
+         VocabCache::default()
+     }
+ 
+-    /// The vocab for `cwd`, building or rebuilding it if needed.
+-    /// STUB: builds every time, no invalidation.
++    /// The vocab for `cwd`, building or rebuilding it if needed. Also
++    /// prepares it for [`apply`], so the first `apply` is as fast as the rest.
+     pub fn get(&mut self, cwd: &Path) -> Arc<RepoVocab> {
+-        let vocab = Arc::new(RepoVocab::build(cwd));
+-        self.entries.insert(cwd.to_path_buf(), vocab.clone());
++        let stamp = vocab::Stamp::of(cwd);
++        let cached = self.entries.get(cwd);
++        if let Some(entry) = cached {
++            if entry.stamp == stamp && entry.built.elapsed() < stamp.ttl() {
++                return entry.vocab.clone();
++            }
++        }
++        // A rebuild that finds nothing new keeps the vocab it had.
++        let built = RepoVocab::build(cwd);
++        let vocab = match cached {
++            Some(entry) if *entry.vocab == built => entry.vocab.clone(),
++            _ => Arc::new(built),
++        };
++        mentions::index_for(&vocab);
++        let entry = CachedVocab {
++            vocab: vocab.clone(),
++            stamp,
++            built: Instant::now(),
++        };
++        self.entries.insert(cwd.to_path_buf(), entry);
+         vocab
+     }
+ }
+@@ -152,11 +176,9 @@ pub struct Context {
+ /// Runs after `cleanup::strip` and before the dictionary. Must never touch
+ /// protected chunks (`text::is_protected`) it did not create, and must be
+ /// conservative: an ambiguous reference stays as spoken.
+-///
+-/// STUB: returns `text` unchanged.
+ pub fn apply(text: &str, context: &Context) -> String {
+-    let _ = context;
+-    text.to_string()
++    let index = mentions::index_for(&context.vocab);
++    mentions::apply(text, &context.vocab, &index)
+ }
+ 
+ #[cfg(test)]
+@@ -181,4 +203,90 @@ mod tests {
+         assert_eq!(s.project(), "squawk");
+         assert_eq!(project_name(Path::new("/")), "/");
+     }
++
++    fn context(vocab: Arc<RepoVocab>) -> Context {
++        Context {
++            session: Session {
++                agent: Agent::Claude,
++                pid: 1,
++                cwd: vocab.root.clone(),
++                tty: None,
++            },
++            vocab,
++        }
++    }
++
++    #[test]
++    fn apply_mentions_files_and_spells_terms() {
++        let ctx = context(Arc::new(RepoVocab {
++            root: PathBuf::from("/Users/you/code/squawk"),
++            files: vec![
++                "CLAUDE.md".into(),
++                "Cargo.toml".into(),
++                "src/audio.rs".into(),
++                "src/context/mod.rs".into(),
++                "src/status_item.rs".into(),
++                "src/ui/mod.rs".into(),
++            ],
++            words: vec!["VocabCache".into(), "status_item".into()],
++        }));
++        assert_eq!(
++            apply("take a look at status item dot rs", &ctx),
++            "take a look at @src/status_item.rs"
++        );
++        assert_eq!(
++            apply("context slash mod dot rs", &ctx),
++            "@src/context/mod.rs"
++        );
++        assert_eq!(apply("audio dot rs", &ctx), "@src/audio.rs");
++        assert_eq!(apply("the claude md", &ctx), "@CLAUDE.md");
++        assert_eq!(apply("cargo toml", &ctx), "@Cargo.toml");
++        assert_eq!(apply("the vocab cache", &ctx), "the VocabCache");
++        // Two files are called mod.rs, and a status item is not a file.
++        assert_eq!(apply("open mod dot rs", &ctx), "open mod dot rs");
++        assert_eq!(apply("the status item", &ctx), "the status item");
++    }
++
++    #[test]
++    fn pipeline_runs_context_between_cleanup_and_dictionary() {
++        use crate::cleanup::CleanupOptions;
++        use crate::dictionary::Dictionary;
++        let ctx = context(Arc::new(RepoVocab {
++            root: PathBuf::from("/repo"),
++            files: vec!["src/audio.rs".into()],
++            words: vec!["Parakeet".into()],
++        }));
++        // The dictionary runs after, and cannot reach into the mention.
++        let dict = Dictionary::parse("audio -> Audio\nparakeet -> the model\n");
++        let out = crate::pipeline::finish(
++            "Um, so the audio from parakeet is in audio dot rs.",
++            &dict,
++            Some(&ctx),
++            &CleanupOptions::default(),
++        );
++        assert_eq!(out, "The Audio from the model is in @src/audio.rs");
++    }
++
++    #[test]
++    fn cache_rebuilds_only_when_the_directory_changes() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::write(dir.path().join("audio.rs"), "").unwrap();
++        let mut cache = VocabCache::new();
++        let first = cache.get(dir.path());
++        assert_eq!(first.root, dir.path());
++        assert_eq!(first.files, ["audio.rs"]);
++        assert!(Arc::ptr_eq(&first, &cache.get(dir.path())));
++
++        std::fs::write(dir.path().join("mixer.rs"), "").unwrap();
++        // Make the change visible even on a coarse filesystem clock.
++        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
++        let handle = std::fs::File::open(dir.path()).unwrap();
++        handle.set_modified(later).unwrap();
++        let second = cache.get(dir.path());
++        assert_eq!(second.files, ["audio.rs", "mixer.rs"]);
++        assert!(Arc::ptr_eq(&second, &cache.get(dir.path())));
++
++        let ctx = context(second);
++        assert_eq!(apply("fix mixer dot rs", &ctx), "fix @mixer.rs");
++    }
+ }
+diff --git a/crates/squawk-core/src/context/vocab.rs b/crates/squawk-core/src/context/vocab.rs
+new file mode 100644
+index 0000000..2ef6bb5
+--- /dev/null
++++ b/crates/squawk-core/src/context/vocab.rs
+@@ -0,0 +1,845 @@
++//! Reading a repo: its files, and the words it writes its own way.
++//!
++//! Files come from git when the directory is in a repo (tracked files plus
++//! new ones that are not ignored), otherwise from a bounded walk. Words come
++//! from three places: the crate/package manifests, the prose of README.md /
++//! CLAUDE.md / CONTEXT.md / AGENTS.md, and the file names themselves.
++
++use std::collections::{BTreeSet, HashSet};
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++use std::sync::mpsc;
++use std::time::{Duration, Instant, SystemTime};
++
++use regex::Regex;
++
++use super::RepoVocab;
++use crate::text;
++
++/// The docs read for vocabulary, matched without regard to case.
++const DOC_NAMES: &[&str] = &["readme.md", "claude.md", "context.md", "agents.md"];
++/// No doc is read past this; the terms that matter are near the top.
++const DOC_MAX_BYTES: u64 = 256 * 1024;
++
++/// Listing untracked files walks the working tree; on a huge repo it gets
++/// this long before the tracked files alone are used.
++const GIT_UNTRACKED_BUDGET: Duration = Duration::from_millis(150);
++const GIT_TRACKED_BUDGET: Duration = Duration::from_secs(2);
++/// Tracked files deleted from the working tree are dropped (one stat each)
++/// in repos up to this size.
++const STAT_MAX_FILES: usize = 20_000;
++
++/// The walk outside git stops at whichever of these comes first.
++const WALK_MAX_FILES: usize = 20_000;
++const WALK_MAX_DEPTH: usize = 8;
++const WALK_BUDGET: Duration = Duration::from_millis(150);
++/// Directories a walk never enters (hidden ones are skipped too).
++const WALK_SKIP_DIRS: &[&str] = &[
++    "node_modules",
++    "target",
++    "build",
++    "dist",
++    "out",
++    "vendor",
++    "venv",
++    "__pycache__",
++    "Pods",
++    "DerivedData",
++];
++
++/// At most this many manifests are opened for package names.
++const MAX_MANIFESTS: usize = 64;
++
++pub(super) fn build(cwd: &Path) -> RepoVocab {
++    let mut files = list_files(cwd);
++    let docs = doc_files(cwd);
++    // The docs can be mentioned even when git ignores them (a local CLAUDE.md).
++    for (name, _) in &docs {
++        if !files.contains(name) {
++            files.push(name.clone());
++        }
++    }
++    files.sort();
++    files.dedup();
++
++    let mut words: BTreeSet<String> = BTreeSet::new();
++    words.extend(package_names(cwd, &files));
++    let mut terms = DocTerms::default();
++    for (i, (_, path)) in docs.iter().chain(&parent_docs(cwd)).enumerate() {
++        if let Some(body) = read_capped(path, DOC_MAX_BYTES) {
++            terms.read(&body, i == 0 && is_readme(path));
++        }
++    }
++    words.extend(terms.finish());
++    words.extend(
++        files
++            .iter()
++            .filter_map(|f| file_stem(f))
++            .filter(|s| s.chars().any(char::is_alphabetic))
++            .map(str::to_string),
++    );
++
++    RepoVocab {
++        root: cwd.to_path_buf(),
++        files,
++        words: words.into_iter().collect(),
++    }
++}
++
++/// `status_item` for `src/status_item.rs`: the name up to its first dot.
++/// Dotfiles have none.
++pub(super) fn file_stem(path: &str) -> Option<&str> {
++    let name = path.rsplit('/').next().unwrap_or(path);
++    let stem = name.split('.').next().unwrap_or(name);
++    (!stem.is_empty()).then_some(stem)
++}
++
++// ---------------------------------------------------------------- files --
++
++fn list_files(cwd: &Path) -> Vec<String> {
++    if git_index(cwd).is_some() {
++        if let Some(files) = git_files(cwd) {
++            return files;
++        }
++    }
++    walk_files(cwd)
++}
++
++/// The index file of the repo `cwd` is in: `<repo>/.git/index`, or the one a
++/// worktree's or submodule's `.git` file points at.
++pub(super) fn git_index(cwd: &Path) -> Option<PathBuf> {
++    for dir in cwd.ancestors() {
++        let dot_git = dir.join(".git");
++        let Ok(meta) = std::fs::metadata(&dot_git) else {
++            continue;
++        };
++        if meta.is_dir() {
++            return Some(dot_git.join("index"));
++        }
++        let pointer = std::fs::read_to_string(&dot_git).ok()?;
++        let git_dir = pointer.lines().find_map(|l| l.strip_prefix("gitdir:"))?;
++        return Some(dir.join(git_dir.trim()).join("index"));
++    }
++    None
++}
++
++fn git_files(cwd: &Path) -> Option<Vec<String>> {
++    let git = git_program()?;
++    let listed = git_ls_files(
++        &git,
++        cwd,
++        &["--cached", "--others", "--exclude-standard"],
++        GIT_UNTRACKED_BUDGET,
++    )
++    .or_else(|| git_ls_files(&git, cwd, &["--cached"], GIT_TRACKED_BUDGET))?;
++    let mut files: Vec<String> = listed
++        .split('\0')
++        .filter(|f| !f.is_empty())
++        .map(str::to_string)
++        .collect();
++    if files.len() <= STAT_MAX_FILES {
++        files.retain(|f| std::fs::symlink_metadata(cwd.join(f)).is_ok());
++    }
++    Some(files)
++}
++
++/// `git ls-files -z <args>` in `cwd`, or `None` if git fails or takes longer
++/// than `budget` (it is killed).
++fn git_ls_files(git: &Path, cwd: &Path, args: &[&str], budget: Duration) -> Option<String> {
++    let mut child = Command::new(git)
++        .arg("-C")
++        .arg(cwd)
++        .args(["ls-files", "-z"])
++        .args(args)
++        .env("GIT_OPTIONAL_LOCKS", "0")
++        .stdin(Stdio::null())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .ok()?;
++    let mut stdout = child.stdout.take()?;
++    let (tx, rx) = mpsc::channel();
++    std::thread::spawn(move || {
++        let mut out = Vec::new();
++        let read = stdout.read_to_end(&mut out).map(|_| out);
++        let _ = tx.send(read);
++    });
++    match rx.recv_timeout(budget) {
++        Ok(Ok(out)) => {
++            let status = child.wait().ok()?;
++            status
++                .success()
++                .then(|| String::from_utf8_lossy(&out).into_owned())
++        }
++        _ => {
++            let _ = child.kill();
++            let _ = child.wait();
++            None
++        }
++    }
++}
++
++/// The git to run. `/usr/bin/git` on a Mac without developer tools is a
++/// shim that opens an install dialog; it is never run in that case.
++fn git_program() -> Option<PathBuf> {
++    let path = std::env::var_os("PATH").unwrap_or_default();
++    let found = std::env::split_paths(&path)
++        .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from))
++        .map(|dir| dir.join("git"))
++        .find(|git| git.is_file())?;
++    if cfg!(target_os = "macos")
++        && found == Path::new("/usr/bin/git")
++        && !Path::new("/Library/Developer/CommandLineTools/usr/bin/git").exists()
++        && !Path::new("/var/db/xcode_select_link").exists()
++    {
++        return None;
++    }
++    Some(found)
++}
++
++fn walk_files(root: &Path) -> Vec<String> {
++    let deadline = Instant::now() + WALK_BUDGET;
++    let mut files = Vec::new();
++    // Breadth first, so a cut-off walk keeps the files nearest the root.
++    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), String::new(), 0)]);
++    while let Some((dir, prefix, depth)) = queue.pop_front() {
++        let Ok(entries) = std::fs::read_dir(&dir) else {
++            continue;
++        };
++        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
++        entries.sort_by_key(|e| e.file_name());
++        for entry in entries {
++            if files.len() >= WALK_MAX_FILES || Instant::now() > deadline {
++                return files;
++            }
++            let Ok(kind) = entry.file_type() else {
++                continue;
++            };
++            let name = entry.file_name().to_string_lossy().into_owned();
++            if kind.is_dir() {
++                let skip = name.starts_with('.') || WALK_SKIP_DIRS.contains(&name.as_str());
++                if !skip && depth < WALK_MAX_DEPTH {
++                    queue.push_back((entry.path(), format!("{prefix}{name}/"), depth + 1));
++                }
++            } else if kind.is_file() && name != ".DS_Store" {
++                files.push(format!("{prefix}{name}"));
++            }
++        }
++    }
++    files
++}
++
++// ----------------------------------------------------------------- docs --
++
++/// The docs in `dir` itself: (name as it is on disk, path).
++fn doc_files(dir: &Path) -> Vec<(String, PathBuf)> {
++    let Ok(entries) = std::fs::read_dir(dir) else {
++        return Vec::new();
++    };
++    let mut docs: Vec<(String, PathBuf)> = entries
++        .filter_map(|e| e.ok())
++        .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()))
++        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
++        .filter(|(name, path)| DOC_NAMES.contains(&name.to_lowercase().as_str()) && path.is_file())
++        .collect();
++    // README first: its title is the project's name.
++    docs.sort_by_key(|(name, _)| (!name.to_lowercase().starts_with("readme"), name.clone()));
++    docs
++}
++
++/// When the session runs in a subdirectory, the repo root's docs still
++/// describe it.
++fn parent_docs(cwd: &Path) -> Vec<(String, PathBuf)> {
++    match cwd.ancestors().find(|dir| dir.join(".git").exists()) {
++        Some(top) if top != cwd => doc_files(top),
++        _ => Vec::new(),
++    }
++}
++
++fn is_readme(path: &Path) -> bool {
++    path.file_name()
++        .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("readme"))
++}
++
++fn read_capped(path: &Path, max: u64) -> Option<String> {
++    let mut bytes = Vec::new();
++    std::fs::File::open(path)
++        .ok()?
++        .take(max)
++        .read_to_end(&mut bytes)
++        .ok()?;
++    Some(String::from_utf8_lossy(&bytes).into_owned())
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum Shape {
++    /// `VocabCache`, `macOS`: casing that cannot be an accident.
++    Inner,
++    /// `NVIDIA`, `API`.
++    Acronym,
++    /// `Parakeet`: a capital, then lowercase.
++    Capital,
++}
++
++fn shape(word: &str) -> Option<Shape> {
++    if word.chars().count() < 2 || !word.chars().all(char::is_alphanumeric) {
++        return None;
++    }
++    let letters = word.chars().filter(|c| c.is_alphabetic()).count();
++    let upper = word.chars().filter(|c| c.is_uppercase()).count();
++    let lower = word.chars().filter(|c| c.is_lowercase()).count();
++    let first = word.chars().next()?;
++    if upper == 0 || letters < 2 {
++        None
++    } else if lower == 0 {
++        Some(Shape::Acronym)
++    } else if text::has_inner_case(word) {
++        Some(Shape::Inner)
++    } else if first.is_uppercase() {
++        Some(Shape::Capital)
++    } else {
++        None
++    }
++}
++
++/// Terms gathered from markdown prose.
++///
++/// A word counts when its casing says it is a name: inner capitals anywhere,
++/// an acronym, or a capital in the middle of a sentence — alone or in a run
++/// ("Claude Code"). A capital that only opens a sentence says nothing, and a
++/// word the docs also write in lowercase is not a name.
++#[derive(Default)]
++struct DocTerms {
++    terms: BTreeSet<String>,
++    /// Capitalised words and acronyms, kept only if never seen lowercase.
++    tentative: BTreeSet<String>,
++    lowercase: HashSet<String>,
++}
++
++struct Seen {
++    word: String,
++    shape: Shape,
++    opens_sentence: bool,
++}
++
++impl DocTerms {
++    fn read(&mut self, body: &str, title_is_name: bool) {
++        let link = Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").expect("valid regex");
++        let code = Regex::new(r"`([^`]*)`").expect("valid regex");
++        let tag = Regex::new(r"<[^>]*>").expect("valid regex");
++        let mut in_fence = false;
++        let mut first_heading = title_is_name;
++        for line in body.lines() {
++            let line = line.trim();
++            if line.starts_with("```") || line.starts_with("~~~") {
++                in_fence = !in_fence;
++                continue;
++            }
++            if in_fence || line.is_empty() {
++                continue;
++            }
++            let heading = line.starts_with('#');
++            let line = line.trim_start_matches('#').trim();
++            if heading && std::mem::take(&mut first_heading) {
++                self.title(line);
++            }
++            let line = link.replace_all(line, "$1");
++            let line = tag.replace_all(&line, " ");
++            for span in code.captures_iter(&line) {
++                // An identifier with inner capitals is a term as written.
++                if shape(&span[1]) == Some(Shape::Inner) {
++                    self.terms.insert(span[1].to_string());
++                }
++            }
++            // A code span breaks a run of words like a comma would.
++            let line = code.replace_all(&line, " , ");
++            self.prose(&line, heading);
++        }
++    }
++
++    /// The README's first heading is the project's name, written however
++    /// the project writes it.
++    fn title(&mut self, heading: &str) {
++        let words: Vec<&str> = heading.split_whitespace().collect();
++        let plain = |w: &&str| w.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c));
++        if (1..=3).contains(&words.len())
++            && words.iter().all(plain)
++            && !words.iter().all(|w| is_common(w))
++        {
++            self.terms.insert(words.join(" "));
++        }
++    }
++
++    fn prose(&mut self, line: &str, heading: bool) {
++        let mut run: Vec<Seen> = Vec::new();
++        let mut opens_sentence = true;
++        for raw in line.split_whitespace() {
++            // List markers and quotes open a sentence without being a word.
++            if matches!(raw, "-" | "*" | "+" | ">") {
++                continue;
++            }
++            // Punctuation on its own ("—", " , " left by a code span).
++            let Some(start) = raw.find(char::is_alphanumeric) else {
++                self.flush(&mut run, heading);
++                opens_sentence |= raw.contains(['.', '?', '!', ':']);
++                continue;
++            };
++            let end = raw
++                .char_indices()
++                .rev()
++                .find(|(_, c)| c.is_alphanumeric())
++                .map_or(raw.len(), |(i, c)| i + c.len_utf8());
++            let (led, word, trail) = (start > 0, &raw[start..end], &raw[end..]);
++            let (word, possessive) =
++                match word.strip_suffix("'s").or_else(|| word.strip_suffix("’s")) {
++                    Some(stem) => (stem, true),
++                    None => (word, false),
++                };
++            let trail_ends_sentence = trail.contains(['.', '?', '!', ':']);
++
++            let named = (!text::is_protected(raw)).then(|| shape(word)).flatten();
++            if led && !opens_sentence {
++                self.flush(&mut run, heading);
++            }
++            match named {
++                Some(shape) => run.push(Seen {
++                    word: word.to_string(),
++                    shape,
++                    opens_sentence: opens_sentence && run.is_empty(),
++                }),
++                None => {
++                    self.flush(&mut run, heading);
++                    for part in word.split(|c: char| !c.is_alphanumeric()) {
++                        if part.chars().any(char::is_lowercase)
++                            && !part.chars().any(char::is_uppercase)
++                        {
++                            self.lowercase.insert(part.to_string());
++                        }
++                    }
++                }
++            }
++            if possessive || !trail.is_empty() {
++                self.flush(&mut run, heading);
++            }
++            // "1." opens a list item; any other word ends the opening.
++            opens_sentence =
++                trail_ends_sentence || (opens_sentence && word.chars().all(|c| c.is_ascii_digit()));
++        }
++        self.flush(&mut run, heading);
++    }
++
++    fn flush(&mut self, run: &mut Vec<Seen>, heading: bool) {
++        let mut run = std::mem::take(run);
++        // A line of capitals is shouting, not three acronyms.
++        if run.len() >= 3 && run.iter().all(|s| s.shape == Shape::Acronym) {
++            return;
++        }
++        // A sentence's first capital means nothing on its own; it stays only
++        // as the start of a longer name ("Claude Code is…"). A heading's
++        // first word is kept: "Parakeet model" is how names appear there.
++        if let Some(first) = run.first() {
++            let uninformative = first.opens_sentence
++                && first.shape == Shape::Capital
++                && (is_common(&first.word) || (run.len() == 1 && !heading));
++            if uninformative {
++                run.remove(0);
++            }
++        }
++        if run.is_empty() || run.len() > 4 {
++            return;
++        }
++        if run.len() >= 2 {
++            let common = run.iter().filter(|s| is_common(&s.word)).count();
++            // Title Case makes every heading look like a name.
++            let is_name = if heading {
++                common == 0
++            } else {
++                common < run.len()
++            };
++            if is_name {
++                let words: Vec<&str> = run.iter().map(|s| s.word.as_str()).collect();
++                self.terms.insert(words.join(" "));
++            }
++        }
++        for seen in run {
++            match seen.shape {
++                Shape::Inner => {
++                    self.terms.insert(seen.word);
++                }
++                Shape::Acronym | Shape::Capital => {
++                    if !is_common(&seen.word) {
++                        self.tentative.insert(seen.word);
++                    }
++                }
++            }
++        }
++    }
++
++    fn finish(self) -> Vec<String> {
++        let DocTerms {
++            mut terms,
++            tentative,
++            lowercase,
++        } = self;
++        terms.extend(
++            tentative
++                .into_iter()
++                .filter(|w| !lowercase.contains(&w.to_lowercase())),
++        );
++        terms.into_iter().collect()
++    }
++}
++
++// ------------------------------------------------------------- packages --
++
++/// The names the repo's own crates and packages go by.
++fn package_names(root: &Path, files: &[String]) -> Vec<String> {
++    let mut manifests: Vec<&String> = files
++        .iter()
++        .filter(|f| {
++            matches!(
++                f.rsplit('/').next().unwrap_or(f),
++                "Cargo.toml" | "package.json" | "pyproject.toml" | "go.mod"
++            )
++        })
++        .collect();
++    // Nearest the root first: those are the ones that name the project.
++    manifests.sort_by_key(|f| f.matches('/').count());
++    let mut names = Vec::new();
++    for file in manifests.into_iter().take(MAX_MANIFESTS) {
++        let Some(body) = read_capped(&root.join(file), DOC_MAX_BYTES) else {
++            continue;
++        };
++        match file.rsplit('/').next().unwrap_or(file) {
++            "Cargo.toml" => {
++                let Ok(doc) = body.parse::<toml::Table>() else {
++                    continue;
++                };
++                names.extend(toml_str(&doc, &["package", "name"]));
++                names.extend(toml_str(&doc, &["lib", "name"]));
++                let bins = doc.get("bin").and_then(|b| b.as_array());
++                for bin in bins.into_iter().flatten() {
++                    names.extend(bin.get("name").and_then(|n| n.as_str()).map(str::to_string));
++                }
++            }
++            "pyproject.toml" => {
++                let Ok(doc) = body.parse::<toml::Table>() else {
++                    continue;
++                };
++                names.extend(toml_str(&doc, &["project", "name"]));
++                names.extend(toml_str(&doc, &["tool", "poetry", "name"]));
++            }
++            "package.json" => {
++                let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
++                    continue;
++                };
++                if let Some(name) = doc.get("name").and_then(|n| n.as_str()) {
++                    // "@scope/name": the scope is not what people say.
++                    names.push(name.rsplit('/').next().unwrap_or(name).to_string());
++                }
++            }
++            _ => {
++                let module = body.lines().find_map(|l| l.trim().strip_prefix("module "));
++                if let Some(module) = module {
++                    names.push(module.trim().rsplit('/').next().unwrap_or("").to_string());
++                }
++            }
++        }
++    }
++    names.retain(|n| {
++        (2..=64).contains(&n.len())
++            && n.chars().any(char::is_alphabetic)
++            && n.chars()
++                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
++    });
++    names
++}
++
++fn toml_str(doc: &toml::Table, path: &[&str]) -> Option<String> {
++    let (last, tables) = path.split_last()?;
++    let mut table = doc;
++    for key in tables {
++        table = table.get(*key)?.as_table()?;
++    }
++    table.get(*last)?.as_str().map(str::to_string)
++}
++
++// ---------------------------------------------------------------- cache --
++
++/// What a cached vocab was built from; a change in any of it means rebuild.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) struct Stamp {
++    /// `.git/index`: its modification time and size.
++    index: Option<(Option<SystemTime>, u64)>,
++    /// The directory itself: a file added to or removed from its top level.
++    root: Option<SystemTime>,
++}
++
++impl Stamp {
++    pub(super) fn of(cwd: &Path) -> Stamp {
++        let index = git_index(cwd).map(|index| match std::fs::metadata(index) {
++            Ok(meta) => (meta.modified().ok(), meta.len()),
++            Err(_) => (None, 0),
++        });
++        let root = std::fs::metadata(cwd).and_then(|m| m.modified()).ok();
++        Stamp { index, root }
++    }
++
++    /// How long a vocab with this stamp is trusted without a change. Git
++    /// says when tracked files change; untracked files, and everything
++    /// outside git, are only seen by looking again.
++    pub(super) fn ttl(&self) -> Duration {
++        if self.index.is_some() {
++            Duration::from_secs(30)
++        } else {
++            Duration::from_secs(5)
++        }
++    }
++}
++
++// ----------------------------------------------------------- stop words --
++
++/// Is this an everyday word, whatever its casing in a doc? Such a word is
++/// never taken for a name: "IMPORTANT", "License" and "Code" stay prose.
++pub(super) fn is_common(word: &str) -> bool {
++    use std::sync::OnceLock;
++    static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
++    let words = WORDS.get_or_init(|| COMMON_WORDS.split_whitespace().collect());
++    let lower = word.to_lowercase();
++    if words.contains(lower.as_str()) {
++        return true;
++    }
++    // Plurals and -ing/-ed forms of the same words.
++    ["s", "es", "ing", "ed", "d"]
++        .iter()
++        .filter_map(|suffix| lower.strip_suffix(suffix))
++        .any(|stem| stem.len() > 2 && words.contains(stem))
++}
++
++const COMMON_WORDS: &str = "
++a about above across act action active actual add added after again against agent ago agree
++all allow almost alone along already also although always am among an and another answer any
++anyone anything app apply approach are area around as ask asked at available avoid away
++back bad base based basic be because become been before begin behavior behind being below best
++better between big bit block both bottom box branch break bring broken bug build built but by
++call called can cannot care case catch cause change changes check choose class clean clear close
++code come command comment commit common communication complete config configuration confirm
++consider contain content context continue contributing contribution control copy core correct
++cost could count create credits critical current custom cut
++data date day debug decide default define delete deploy describe design detail details develop
++developer development did different direct directory do document documentation does doing done
++down download draft drop during
++each early easy edit either else empty enable end engine enough ensure enter entry environment
++error even ever every everything example examples except exist existing expect explain extra
++fact fail false faq fast feature features few field file files final find fine first fix flag
++flow focus folder follow following for force form format found free from full function further
++general get getting give given global go goal goes going good got great group guide guidelines
++had half hand handle happen hard has have he head help her here high him his history hold home
++hook how however
++i idea if ignore implement implementation import important in include info information input
++inside install installation instead instruction instructions interface into introduction is
++issue issues it item its itself
++job join just
++keep key kind know known
++language large last late later layout learn least leave left less let level library license
++like limit line link list little live load local log long look lot low
++machine made main make manage many map mark match may maybe me mean meet meeting memory menu
++message method might mind miss mode model module more most move much must my
++name near need never new next no none nor normal not note notes nothing notice now number
++of off offer often ok okay old on once one only open option optional options or order other
++others our out output over overview own
++page part pass past path pattern people per permission person pick place plan please point
++possible post prefer prerequisites present press pretty print private problem process product
++progress project prompt provide public pull purpose push put
++question quick quickstart quite
++rather raw read ready real really reason record reference related release remember remove
++repo report repository request require required requirements reset resource rest result return
++review right roadmap root rule rules run running
++safe same save say scope script search second section security see seem select send sense
++separate server service session set setup several shall share she short should show side
++sign simple since single site size skip small so some someone something sometimes soon sort
++source space special specific spec stage standard start started state status step still stop
++store string structure style such support sure system
++table take talk target task team tell term terminal test testing tests text than thank thanks
++that the their them then there these they thing things think this those though three through
++time tip tips title to today together too tool tools top total toward track transcript try
++turn two type
++under understand unit until up update upon us usage use used user using usual usually
++value version very via view
++wait want warning was way we week welcome well were what when where whether which while who
++whole why will with within without word words work workflow working world would write writing
++wrong
++yes yet you your
++todo fixme done wip tbd na nb ps
++";
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn terms(body: &str) -> Vec<String> {
++        let mut t = DocTerms::default();
++        t.read(body, true);
++        t.finish()
++    }
++
++    fn has(words: &[String], word: &str) -> bool {
++        words.iter().any(|w| w == word)
++    }
++
++    #[test]
++    fn names_come_from_casing() {
++        let words = terms(
++            "# squawk\n\n\
++             Local dictation for macOS. Built for talking to Claude Code in a terminal.\n\
++             Everything runs on your Mac with NVIDIA's Parakeet TDT 0.6B v3. No API keys.\n\
++             The `VocabCache` holds a `RepoVocab`; see `map_prose`.\n",
++        );
++        for term in [
++            "squawk",
++            "macOS",
++            "Claude Code",
++            "Claude",
++            "Mac",
++            "NVIDIA",
++            "Parakeet TDT",
++            "Parakeet",
++            "TDT",
++            "API",
++            "VocabCache",
++            "RepoVocab",
++        ] {
++            assert!(has(&words, term), "{term} in {words:?}");
++        }
++        for not in [
++            "Local",
++            "Built",
++            "Everything",
++            "No",
++            "The",
++            "Code",
++            "map_prose",
++        ] {
++            assert!(!has(&words, not), "{not} in {words:?}");
++        }
++    }
++
++    #[test]
++    fn everyday_words_are_not_names() {
++        let words = terms(
++            "# Notes\n\n## License\n\n## Getting Started\n\n\
++             IMPORTANT: you MUST NOT push. This is VERY IMPORTANT STUFF.\n\
++             See the Transcripts section; transcripts live elsewhere.\n\
++             ```\nlet Thing = OtherThing;\n```\n\
++             Read [the Guide](https://example.com/Guide) and src/Main.rs.\n",
++        );
++        assert_eq!(words, Vec::<String>::new());
++    }
++
++    #[test]
++    fn headings_can_name_things() {
++        let words = terms("# Acme Tool\n\n## Parakeet model\n\n## Usage\n");
++        assert!(has(&words, "Acme Tool"), "{words:?}");
++        assert!(has(&words, "Parakeet"), "{words:?}");
++        assert!(!has(&words, "Usage"), "{words:?}");
++    }
++
++    #[test]
++    fn stems() {
++        assert_eq!(file_stem("src/status_item.rs"), Some("status_item"));
++        assert_eq!(file_stem("a/b/foo.test.ts"), Some("foo"));
++        assert_eq!(file_stem("Makefile"), Some("Makefile"));
++        assert_eq!(file_stem(".gitignore"), None);
++    }
++
++    fn write(root: &Path, file: &str, body: &str) {
++        let path = root.join(file);
++        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
++        std::fs::write(path, body).unwrap();
++    }
++
++    fn git(root: &Path, args: &[&str]) {
++        let ok = Command::new("git")
++            .arg("-C")
++            .arg(root)
++            .args(args)
++            .output()
++            .unwrap()
++            .status
++            .success();
++        assert!(ok, "git {args:?}");
++    }
++
++    #[test]
++    fn walks_a_plain_directory() {
++        let dir = tempfile::tempdir().unwrap();
++        write(dir.path(), "src/audio.rs", "");
++        write(dir.path(), "README.md", "# Thing\n\nUses Parakeet.\n");
++        write(dir.path(), "node_modules/x/index.js", "");
++        write(dir.path(), ".hidden/secret.txt", "");
++        write(dir.path(), "package.json", r#"{"name": "@acme/thing-cli"}"#);
++        let vocab = build(dir.path());
++        assert_eq!(vocab.root, dir.path());
++        assert_eq!(vocab.files, ["README.md", "package.json", "src/audio.rs"]);
++        for word in ["Parakeet", "thing-cli", "audio", "README"] {
++            assert!(has(&vocab.words, word), "{word} in {:?}", vocab.words);
++        }
++    }
++
++    #[test]
++    fn git_repo_lists_tracked_and_new_files_but_not_ignored_ones() {
++        let dir = tempfile::tempdir().unwrap();
++        let root = dir.path();
++        git(root, &["init", "-q"]);
++        write(root, ".gitignore", "target/\nCLAUDE.md\n");
++        write(
++            root,
++            "Cargo.toml",
++            "[workspace]\nmembers = [\"crates/a\"]\n",
++        );
++        write(
++            root,
++            "crates/a/Cargo.toml",
++            "[package]\nname = \"acme-core\"\nversion = \"0.1.0\"\n",
++        );
++        write(root, "crates/a/src/status_item.rs", "");
++        write(root, "crates/a/src/gone.rs", "");
++        git(root, &["add", "."]);
++        write(root, "crates/a/src/fresh.rs", "");
++        write(root, "target/debug/junk.rs", "");
++        write(root, "CLAUDE.md", "Talk to GitHub.\n");
++        std::fs::remove_file(root.join("crates/a/src/gone.rs")).unwrap();
++
++        let vocab = build(root);
++        assert_eq!(
++            vocab.files,
++            [
++                ".gitignore",
++                "CLAUDE.md",
++                "Cargo.toml",
++                "crates/a/Cargo.toml",
++                "crates/a/src/fresh.rs",
++                "crates/a/src/status_item.rs",
++            ]
++        );
++        for word in ["acme-core", "status_item", "GitHub", "Cargo"] {
++            assert!(has(&vocab.words, word), "{word} in {:?}", vocab.words);
++        }
++
++        // From a subdirectory, paths are relative to it.
++        let sub = build(&root.join("crates/a"));
++        assert_eq!(
++            sub.files,
++            ["Cargo.toml", "src/fresh.rs", "src/status_item.rs"]
++        );
++        assert!(has(&sub.words, "GitHub"));
++    }
++
++    #[test]
++    fn a_missing_directory_is_an_empty_vocab() {
++        let vocab = build(Path::new("/nonexistent/squawk/test"));
++        assert_eq!(vocab.root, Path::new("/nonexistent/squawk/test"));
++        assert!(vocab.files.is_empty() && vocab.words.is_empty());
++    }
++}

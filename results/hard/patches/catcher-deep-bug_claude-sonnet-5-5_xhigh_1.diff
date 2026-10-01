@@ -1,0 +1,676 @@
+diff --git a/README.md b/README.md
+index 5f74fb4..9aa145b 100644
+--- a/README.md
++++ b/README.md
+@@ -27,7 +27,7 @@ or `cargo install catcher`. Then run `catcher`.
+ - `#tags` are coloured, inline or as front matter `tags:`. **⌥⏎** or a click on one opens **^O** cut to the notes that carry it.
+ - A ` ```mermaid ` fence is drawn as text: flowcharts and sequence diagrams, in box-drawing characters, no images and no network. Other kinds keep their source under a label.
+ - Callouts, front matter, tables wider than the page (they pan sideways), checkboxes and `==highlights==` all render.
+-- Sections fold. On a heading, **⌥←** folds everything under it down to the next heading of the same or a higher level, **⌥→** opens it again; a folded heading shows `▸` and how many lines it hides. Folds are per note and last for the session; the reading view ignores them.
++- Sections fold. On a heading, **⌥←** folds everything under it down to the next heading of the same or a higher level, **⌥→** opens it again; a folded heading shows `▸` and how many lines it hides. Folds are per note and last for the session: they follow a note through a rename or a move, and through a reload from disk. The reading view shows them the same way, and a click on a heading there folds or unfolds it.
+ - Notes autosave. Edit a note in another program and catcher takes what is on disk: the buffer reloads, the cursor stays on its line, and **^Z** brings the old buffer back. A file deleted from under it is said so in the status bar and recreated on the next save.
+ - Mouse works: click, drag to select and copy, scroll. **^V** pastes a clipboard image as a PNG.
+ 
+@@ -67,7 +67,7 @@ Editing is macOS-style: `⌘←`/`⌘→` line ends, `⌥←`/`⌥→` by word,
+ 
+ ## Settings
+ 
+-**^,** opens `~/.config/catcher/settings.md` as a note; **^S** applies it. It covers the notes and attachments folders, the daily note's folder and template, theme (`auto`, `dark`, `light`) and colours, page width, borders, status bar, autosave delay, tab width, front matter, table style, wikilinks, whether a rename updates links, linked mentions, how far **^O** looks, and every key binding (`key_fold`, `key_unfold`, and the unbound `key_fold_all` / `key_unfold_all` among them). Each line has a one-line hint beside it. `CATCHER_DIR` overrides the notes folder.
++**^,** opens `~/.config/catcher/settings.md` as a note; **^S** applies it. It covers the notes and attachments folders, the daily note's folder and template, theme (`auto`, `dark`, `light`) and colours, page width, borders, status bar, autosave delay, tab width, front matter, table style, wikilinks, whether a rename updates links, linked mentions, how far **^O** looks, and every key binding (`key_fold`, `key_unfold`, and the unbound `key_fold_all` / `key_unfold_all` among them). Each line has a one-line hint beside it. `CATCHER_DIR` overrides the notes folder for that run and is never written to the file.
+ 
+ ## Development
+ 
+diff --git a/src/app.rs b/src/app.rs
+index 016bc69..b9efd75 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -852,6 +852,7 @@ impl App {
+                 // just typed turn up in the footer of the note it names
+                 self.mentions.invalidate();
+                 if now != path {
++                    self.folds.rename(&path, &now);
+                     if let Some(done) = self.update_links(&path, &now) {
+                         self.flash(format!("renamed · {done}"));
+                     }
+@@ -931,6 +932,16 @@ impl App {
+         }
+         self.editor.replace_all(&self.notes[self.active].content);
+         self.dirty = false;
++        // the lines moved under the folds: each follows its heading, and the
++        // mapping the draw reads is rebuilt from the new text
++        let blocks = self.blocks();
++        self.folds
++            .settle(&self.notes[self.active].path, self.editor.lines(), &blocks);
++        self.refresh_visible();
++        // a cursor the new text left inside a fold steps out of it: the
++        // folds are the user's, and a reload is not an edit of theirs
++        let row = self.editor.cursor.0;
++        self.leave_folds(row);
+         self.mentions.invalidate();
+         self.flash(if dropped {
+             "reloaded: changed on disk, your last edits were dropped".to_string()
+@@ -1457,6 +1468,11 @@ impl App {
+     }
+ 
+     fn open_quick_open(&mut self) {
++        // what the search reads is the file, so the file must say what the
++        // buffer does: a hit's line number is only the line you see when the
++        // text it was counted in is the text on screen. Saving can rename the
++        // note, which is why this comes before the index is read.
++        self.save_now();
+         self.query.clear();
+         self.selected = 0;
+         self.tag_filter = None;
+@@ -1509,7 +1525,19 @@ impl App {
+             return;
+         };
+         self.open_path(&path);
++        // the line numbers are the file's as it was read for the search; a
++        // copy of the note this session holds from before is not that file
++        if notes::check_disk(&self.notes[self.active]) == notes::Disk::Changed {
++            self.reload_from_disk();
++        }
+         self.editor.set_cursor((line, 0));
++        // a line inside a closed section is opened to, not left behind it
++        let row = self.editor.cursor.0;
++        let path = self.notes[self.active].path.clone();
++        let blocks = self.blocks();
++        if self.folds.reveal(&path, self.editor.lines(), &blocks, row) {
++            self.refresh_visible();
++        }
+         self.preview_goto = Some(line);
+     }
+ 
+@@ -1880,8 +1908,10 @@ impl App {
+     /// if the folder already has one by that name); the title is untouched.
+     fn commit_move(&mut self, dir: &Path) {
+         let label = self.move_label(dir);
++        let old = self.active_note().path.clone();
+         match notes::move_file(&mut self.notes[self.active], dir) {
+             Ok(path) => {
++                self.folds.rename(&old, &path);
+                 let name = path
+                     .file_name()
+                     .map(|n| n.to_string_lossy().into_owned())
+@@ -1924,6 +1954,7 @@ impl App {
+                     .map(|n| n.to_string_lossy().into_owned())
+                     .unwrap_or_default();
+                 let done = if path != old {
++                    self.folds.rename(&old, &path);
+                     self.update_links(&old, &path)
+                 } else {
+                     None
+@@ -2498,6 +2529,10 @@ impl App {
+             self.toggle_checkbox(row);
+             return;
+         }
++        // a heading is where a section opens and closes, as it is in the editor
++        if self.fold_at_preview(x, y) {
++            return;
++        }
+         if self.config.preview_click == PreviewClick::Edit {
+             self.edit_at_preview(x, y);
+             return;
+@@ -2506,6 +2541,41 @@ impl App {
+         self.preview_dragging = true;
+     }
+ 
++    /// A click on a heading in the reading view folds its section, or opens it
++    /// again when it is folded. Whether the click was one: a line that is not
++    /// a heading, or a heading with nothing under it, is left to the click.
++    fn fold_at_preview(&mut self, x: u16, y: u16) -> bool {
++        let at = ratatui::layout::Position { x, y };
++        let Some(line) = self
++            .preview_rows
++            .iter()
++            .find(|(r, _, _)| r.contains(at))
++            .and_then(|(_, line, _)| *line)
++        else {
++            return false;
++        };
++        let blocks = self.blocks();
++        if crate::fold::heading_at(self.editor.lines(), &blocks, line).is_none() {
++            return false;
++        }
++        let path = self.notes[self.active].path.clone();
++        if !self.folds.unfold(&path, line)
++            && self
++                .folds
++                .fold(&path, self.editor.lines(), &blocks, line)
++                .is_none()
++        {
++            return false;
++        }
++        // the rows under the pointer are about to be different ones
++        self.preview_sel = None;
++        self.refresh_visible();
++        // a cursor the section just closed over goes to its heading
++        let row = self.editor.cursor.0;
++        self.leave_folds(row);
++        true
++    }
++
+     /// The old behaviour, kept behind `preview_click: edit`: land in the
+     /// editor at the spot that was clicked.
+     fn edit_at_preview(&mut self, x: u16, y: u16) {
+diff --git a/src/config.rs b/src/config.rs
+index 9bdd706..a946bc3 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -250,6 +250,13 @@ pub fn config_dir() -> Result<PathBuf> {
+     Ok(new)
+ }
+ 
++/// The notes folder the environment asks for, if it does.
++fn env_notes_dir() -> Option<PathBuf> {
++    std::env::var_os("CATCHER_DIR")
++        .or_else(|| std::env::var_os("TINYNOTE_DIR"))
++        .map(PathBuf::from)
++}
++
+ /// `~/catcher`, unless the notes are still in the `~/tinynote` the app
+ /// used before it was renamed and no `~/catcher` exists yet.
+ fn default_notes_dir(home: &Path) -> PathBuf {
+@@ -271,27 +278,32 @@ impl Config {
+     /// `config.toml` are carried across once, so an upgrade keeps its notes
+     /// dir and theme without the user doing anything.
+     pub fn load() -> Result<Config> {
+-        let path = settings_path()?;
++        Config::load_from(&settings_path()?, legacy_config_path().ok(), env_notes_dir())
++    }
++
++    /// [`Config::load`] against a given settings file, legacy file and
++    /// environment notes folder. What comes back has the environment's folder
++    /// in it; what is written to `path` never does — `CATCHER_DIR` points one
++    /// session elsewhere, and must not become the setting.
++    fn load_from(path: &Path, legacy: Option<PathBuf>, env: Option<PathBuf>) -> Result<Config> {
+         if !path.exists() {
+-            let seed = legacy_config_path()
+-                .ok()
++            let seed = legacy
+                 .and_then(|p| fs::read_to_string(p).ok())
+                 .unwrap_or_default();
+-            let migrated = Config::from_str(&seed);
+-            write_settings(&path, &migrated)?;
+-            return Ok(migrated);
++            write_settings(path, &Config::parse(&seed, None))?;
++            return Ok(Config::parse(&seed, env));
+         }
+         let text =
+-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+-        let config = Config::from_str(&text);
++            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
++        let stored = Config::parse(&text, None);
+         // A settings file written by an older catcher is missing whatever has
+         // been added since, and a setting you cannot see is a setting you do
+         // not have. Rewriting is safe because the document is generated from
+         // the config the file was just parsed into: every value survives.
+-        if !covers_every_setting(&text, &config) {
+-            let _ = write_settings(&path, &config);
++        if !covers_every_setting(&text, &stored) {
++            let _ = write_settings(path, &stored);
+         }
+-        Ok(config)
++        Ok(Config::parse(&text, env))
+     }
+ 
+     /// Push everything this config decides into the places that read it
+@@ -303,8 +315,16 @@ impl Config {
+         crate::md::tags::set_enabled(self.tags);
+     }
+ 
+-    #[allow(clippy::should_implement_trait)]
++    /// The settings in `text`, under the environment this process runs in.
++    #[allow(clippy::should_implement_trait, dead_code)]
+     pub fn from_str(text: &str) -> Config {
++        Config::parse(text, env_notes_dir())
++    }
++
++    /// The settings in `text`. With `env` the environment's notes folder wins
++    /// over the file's, which is how a session is run; without it the config
++    /// is only what the file says, which is what may be written back to it.
++    fn parse(text: &str, env: Option<PathBuf>) -> Config {
+         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+         let mut c = Config::default();
+ 
+@@ -313,10 +333,8 @@ impl Config {
+             c.attachments_dir = c.notes_dir.join("attachments");
+         }
+         // the environment wins: it is how a one-off session is pointed elsewhere
+-        if let Some(d) =
+-            std::env::var_os("CATCHER_DIR").or_else(|| std::env::var_os("TINYNOTE_DIR"))
+-        {
+-            c.notes_dir = PathBuf::from(d);
++        if let Some(d) = env {
++            c.notes_dir = d;
+             c.attachments_dir = c.notes_dir.join("attachments");
+         }
+         if let Some(v) = value(text, "attachments_dir") {
+@@ -1286,4 +1304,34 @@ mod tests {
+         assert_eq!(c.palette.code_bg, theme::LIGHT.code_bg);
+         assert_eq!(c.palette.accent, theme::LIGHT.accent);
+     }
++
++    #[test]
++    fn the_environment_s_notes_dir_is_never_written_to_the_settings_file() {
++        let dir = std::env::temp_dir().join(format!("catcher-config-env-{}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        let path = dir.join("settings.md");
++        let demo = Some(PathBuf::from("/tmp/demo"));
++
++        // first run: the session uses the environment's folder, the file does not
++        let c = Config::load_from(&path, None, demo.clone()).unwrap();
++        assert_eq!(c.notes_dir, PathBuf::from("/tmp/demo"));
++        assert_eq!(c.attachments_dir, PathBuf::from("/tmp/demo/attachments"));
++        let written = fs::read_to_string(&path).unwrap();
++        assert!(!written.contains("/tmp/demo"), "{written}");
++        assert_eq!(
++            Config::parse(&written, None).notes_dir,
++            Config::default().notes_dir
++        );
++
++        // a file from before a setting existed is brought up to date, and what
++        // it said for notes_dir is kept rather than replaced by the environment's
++        fs::write(&path, "## Folders\n\n- notes_dir: /vault\n").unwrap();
++        let c = Config::load_from(&path, None, demo).unwrap();
++        assert_eq!(c.notes_dir, PathBuf::from("/tmp/demo"));
++        let written = fs::read_to_string(&path).unwrap();
++        assert!(covers_every_setting(&written, &c));
++        assert!(!written.contains("/tmp/demo"), "{written}");
++        assert_eq!(Config::parse(&written, None).notes_dir, PathBuf::from("/vault"));
++        let _ = fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/src/contents.rs b/src/contents.rs
+index e0bb305..70d67dc 100644
+--- a/src/contents.rs
++++ b/src/contents.rs
+@@ -258,4 +258,13 @@ mod tests {
+             .collect::<String>()
+             .starts_with('…'));
+     }
++
++    #[test]
++    fn a_hit_s_line_is_its_index_among_the_lines_an_editor_would_split() {
++        let bodies = vec![Some("---\ntags: x\n---\n\n# T\r\nfirst\r\nsecond needle\n".to_string())];
++        let (hits, _) = search(&bodies, "needle", 10);
++        assert_eq!(hits[0].line, 6);
++        let lines: Vec<&str> = bodies[0].as_deref().unwrap().lines().collect();
++        assert_eq!(lines[hits[0].line], "second needle");
++    }
+ }
+diff --git a/src/fold.rs b/src/fold.rs
+index 3b6380d..1564c67 100644
+--- a/src/fold.rs
++++ b/src/fold.rs
+@@ -115,6 +115,17 @@ impl Folds {
+             .count()
+     }
+ 
++    /// The note at `old` now lives at `new`: its folds go with it, replacing
++    /// whatever `new` had.
++    pub fn rename(&mut self, old: &Path, new: &Path) {
++        if old == new {
++            return;
++        }
++        if let Some(m) = self.by_note.remove(old) {
++            self.by_note.insert(new.to_path_buf(), m);
++        }
++    }
++
+     /// Open every fold in `path`. How many there were.
+     pub fn unfold_all(&mut self, path: &Path) -> usize {
+         self.by_note.remove(path).map_or(0, |m| m.len())
+@@ -454,4 +465,41 @@ mod tests {
+         let plain = Visible::new(&l, &b, &[]);
+         assert_eq!(plain.scroll_for(0, 7, 3), 5);
+     }
++
++    #[test]
++    fn folds_go_with_a_note_that_is_renamed_or_moved() {
++        let (l, b) = note();
++        let mut f = Folds::default();
++        let (old, new) = (Path::new("a/old.md"), Path::new("b/new.md"));
++        f.fold(old, &l, &b, 2);
++        f.fold(old, &l, &b, 7);
++        f.rename(old, new);
++        assert_eq!(f.of(new), vec![2, 7]);
++        assert!(f.of(old).is_empty());
++        // a name with nothing folded under it, or the same name, changes nothing
++        f.rename(Path::new("none.md"), Path::new("other.md"));
++        assert!(f.of(Path::new("other.md")).is_empty());
++        f.rename(new, new);
++        assert_eq!(f.of(new), vec![2, 7]);
++    }
++
++    #[test]
++    fn a_rewritten_note_keeps_the_sections_that_were_folded() {
++        let (l, b) = note();
++        let mut f = Folds::default();
++        let p = Path::new("n.md");
++        f.fold(p, &l, &b, 2);
++        // a sync put two lines on top and took one out from inside the section
++        let mut l2 = lines("top\nmore top\n");
++        l2.extend(l.iter().cloned());
++        l2.remove(5);
++        let b2 = md::blocks(&l2);
++        f.settle(p, &l2, &b2);
++        assert_eq!(f.of(p), vec![4]);
++        let v = Visible::new(&l2, &b2, &f.of(p));
++        assert_eq!(l2[4], "## One");
++        assert!(!v.is_hidden(4));
++        assert!(v.is_hidden(5) && v.is_hidden(7));
++        assert!(!v.is_hidden(8));
++    }
+ }
+diff --git a/src/index.rs b/src/index.rs
+index 789ad1a..964dc9e 100644
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -685,4 +685,18 @@ mod tests {
+         assert_eq!(title_at(&path), "Job Application Log");
+         let _ = fs::remove_dir_all(&dir);
+     }
++
++    #[test]
++    fn a_link_to_ones_own_heading_does_not_make_a_tag() {
++        let guide = "# Install\n\n[[#Setup]] and [[#Setup|set up]]\n\n## Setup\n";
++        assert!(tags_of(guide).is_empty());
++        let dir = tmpdir("selflink");
++        fs::write(dir.join("guide.md"), guide).unwrap();
++        fs::write(dir.join("tagged.md"), "# T\n#setup\n").unwrap();
++        let found = scan(std::slice::from_ref(&dir), &[]);
++        let names = |ix: Vec<usize>| -> Vec<String> {
++            ix.into_iter().map(|i| found[i].name()).collect()
++        };
++        assert_eq!(names(with_tag(&found, "setup")), vec!["tagged"]);
++    }
+ }
+diff --git a/src/md.rs b/src/md.rs
+index 931078c..06ea21c 100644
+--- a/src/md.rs
++++ b/src/md.rs
+@@ -1199,6 +1199,11 @@ pub fn tag_at(src: &[char], i: usize) -> Option<usize> {
+     if src.get(i) != Some(&'#') || !tag_boundary(i.checked_sub(1).map(|k| src[k])) {
+         return None;
+     }
++    // `[[#Heading]]` points at a place in the note it is written in, and the
++    // `#` there is that link's own syntax
++    if i >= 2 && src[i - 2..i] == ['[', '['] {
++        return None;
++    }
+     if !src.get(i + 1).is_some_and(|c| c.is_alphabetic()) {
+         return None;
+     }
+@@ -1239,6 +1244,12 @@ pub fn tags_in(line: &str) -> Vec<(usize, usize)> {
+                 }
+             }
+             '[' => {
++                // a wikilink is one thing, as it is drawn: a `#` in its label
++                // is not a tag
++                if let Some(w) = wikilink_at(&src, i).filter(|_| links::enabled()) {
++                    i = w.end;
++                    continue;
++                }
+                 if let Some(close) = find(&src, i + 1, ']') {
+                     if src.get(close + 1) == Some(&'(') {
+                         if let Some(paren) = find(&src, close + 2, ')') {
+@@ -2835,4 +2846,23 @@ mod tests {
+             "code without a foreground is unreadable on a terminal whose ink matches code_bg"
+         );
+     }
++
++    #[test]
++    fn a_link_to_a_heading_of_the_same_note_is_not_a_tag() {
++        tags::set_enabled(true);
++        links::set_enabled(true);
++        assert!(tags_in("see [[#Setup]] first").is_empty());
++        assert!(tags_in("see [[#Setup|the setup]] first").is_empty());
++        assert!(tags_in("![[#Setup]]").is_empty());
++        // a tag beside one still is, and a heading of another note never was
++        assert_eq!(tags_in("[[#Setup]] #real"), vec![(11, 16)]);
++        assert!(tags_in("[[install#Setup]]").is_empty());
++        // nor is a `#` in a wikilink's label, which is not drawn as one
++        assert_eq!(tags_in("[[note|a #b]] #c"), vec![(14, 16)]);
++
++        // and what is drawn agrees with what is counted
++        let l = style_line("see [[#Setup]] first");
++        assert!(l.cells.iter().all(|c| c.style.fg != theme::tag().fg));
++        assert_eq!(link_at("see [[#Setup]] first", 7), None);
++    }
+ }
+diff --git a/src/render.rs b/src/render.rs
+index 5399ad4..880c832 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -135,6 +135,46 @@ pub fn render_page_at(
+     r.finish()
+ }
+ 
++/// Close the folds the editor has on a rendered page: every row drawn from a
++/// hidden source line goes, and a folded heading gets the `▸ ` the editor
++/// puts in front of it. `hidden` and `folded` answer for a source line.
++///
++/// A row the renderer invented — the blank between two blocks — has no source
++/// line to ask about, so it follows the row before it: a blank after hidden
++/// text is hidden with it. That leaves the one blank that came before the
++/// folded section and drops the one that came before whatever follows it, so a
++/// column of closed headings is spaced the way a column of open ones is.
++/// Call it before [`append_mentions`]: the footer is not part of any section.
++pub fn fold_page(
++    r: &mut Rendered,
++    hidden: impl Fn(usize) -> bool,
++    folded: impl Fn(usize) -> bool,
++) {
++    let mut gone = false;
++    let mut marked: Option<usize> = None;
++    let mut kept = Vec::with_capacity(r.lines.len());
++    for mut line in std::mem::take(&mut r.lines) {
++        match line.src_line {
++            Some(l) => {
++                gone = hidden(l);
++                if gone {
++                    continue;
++                }
++                if folded(l) && marked != Some(l) {
++                    marked = Some(l);
++                    let mut cells = str_cells(theme::FOLDED, theme::fold());
++                    cells.append(&mut line.cells);
++                    line.cells = cells;
++                }
++            }
++            None if gone => continue,
++            None => {}
++        }
++        kept.push(line);
++    }
++    r.lines = kept;
++}
++
+ /// Add the linked-mentions footer to an already-rendered page: a rule, a count,
+ /// and one row per note that links here.
+ ///
+@@ -721,7 +761,10 @@ impl Ren {
+                     0 => at(0).and_then(|o| self.src[..o].chars().next_back()),
+                     _ => Some(chars[i - 1]),
+                 };
+-                if crate::md::tag_boundary(prev) {
++                // the chars of this event may start at the `#`, so the `[[`
++                // before a `[[#Heading]]` is read off the source as well
++                let heading_link = at(i).is_some_and(|o| self.src[..o].ends_with("[["));
++                if crate::md::tag_boundary(prev) && !heading_link {
+                     if let Some(end) = crate::md::tag_at(&chars, i) {
+                         let name: String = chars[i + 1..end].iter().collect();
+                         self.push_at(&std::mem::take(&mut run), base, None, at(run_start));
+@@ -2320,4 +2363,44 @@ mod tests {
+         let row = r.lines.iter().find(|l| l.text().contains("meta")).unwrap();
+         assert!(!row.text().contains("about"));
+     }
++
++    #[test]
++    fn a_link_to_ones_own_heading_is_not_drawn_as_a_tag() {
++        let r = render("see [[#Setup]] first\n");
++        assert!(r
++            .lines
++            .iter()
++            .flat_map(|l| l.cells.iter())
++            .all(|c| c.style.fg != theme::tag().fg));
++        assert!(r.urls.is_empty());
++    }
++
++    #[test]
++    fn closing_a_fold_drops_its_rows_and_marks_the_heading() {
++        let md = "# Title\n\nintro\n\n## One\n\na\n\nb\n\n## Two\n\nd\n";
++        let mut r = render(md);
++        // One is folded: lines 5..=9 go
++        fold_page(&mut r, |l| (5..=9).contains(&l), |l| l == 4);
++        let text: Vec<String> = r.lines.iter().map(|l| l.text()).collect();
++        assert_eq!(
++            text,
++            vec!["Title", "", "intro", "", "▸ One", "", "Two", "", "d"]
++        );
++        // the heading still maps back to its own line, and the marker to none
++        let one = &r.lines[4];
++        assert_eq!(one.src_line, Some(4));
++        assert_eq!(one.cells[0].src, None);
++        assert_eq!(one.cells[0].style, theme::fold());
++        assert_eq!(one.cells[2].src, Some((4, 3)));
++    }
++
++    #[test]
++    fn a_page_with_nothing_folded_comes_out_as_it_went_in() {
++        let md = "# A\n\ntext\n\n## B\n\nmore\n";
++        let mut r = render(md);
++        let before: Vec<String> = r.lines.iter().map(|l| l.text()).collect();
++        fold_page(&mut r, |_| false, |_| false);
++        let after: Vec<String> = r.lines.iter().map(|l| l.text()).collect();
++        assert_eq!(before, after);
++    }
+ }
+diff --git a/src/ui.rs b/src/ui.rs
+index 3f74bd3..ad33cfe 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -255,6 +255,9 @@ struct Row {
+     src_line: Option<usize>,
+     /// A row of a scrolling table: never soft-wrapped, panned instead.
+     wide: bool,
++    /// What a folded heading says at its right edge, on its first row. Drawn
++    /// after the row is recorded, so a selection never copies it.
++    label: Option<String>,
+ }
+ 
+ /// The rendered page: pre-wrapped so every row is exactly one screen line,
+@@ -270,6 +273,13 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+         .map_or((0, 0), |r| (r.end, content[..r.end].lines().count()));
+     let mut rendered =
+         crate::render::render_page_at(&content[skip..], first, width, app.config.table_style);
++    // the folds the editor has are closed here too, before the footer, which
++    // belongs to the page and not to any section of it
++    crate::render::fold_page(
++        &mut rendered,
++        |l| app.visible.is_hidden(l),
++        |l| app.folded_here(l),
++    );
+     // the footer arrives a frame or two late by design: the scan behind it
+     // reads every note body under the roots, and a page that waited for that
+     // would be a page that stuttered on every open
+@@ -287,7 +297,14 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+     // (first page row, rows, image index) — kept aside from the visible window
+     // so a band whose own first row is scrolled off the top is still drawn
+     let mut bands: Vec<(usize, u16, usize)> = Vec::new();
++    // the folded heading that has already been given its label: a heading that
++    // wrapped is one heading, and says so once
++    let mut labeled: Option<usize> = None;
+     for pline in &rendered.lines {
++        let label = pline
++            .src_line
++            .filter(|&l| labeled != Some(l))
++            .and_then(|l| app.fold_label(l).inspect(|_| labeled = Some(l)));
+         if let Some(idx) = pline.image {
+             let url = rendered.images[idx].url.clone();
+             if let Some(natural) = app.images.rows(&url, &dir, area.width) {
+@@ -301,6 +318,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+                         checkbox: None,
+                         src_line: pline.src_line,
+                         wide: false,
++                        label: None,
+                     });
+                 }
+                 continue;
+@@ -313,6 +331,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+                 checkbox: pline.checkbox,
+                 src_line: pline.src_line,
+                 wide: true,
++                label: None,
+             });
+             continue;
+         }
+@@ -322,6 +341,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+                 checkbox: if i == 0 { pline.checkbox } else { None },
+                 src_line: pline.src_line,
+                 wide: false,
++                label: if i == 0 { label.clone() } else { None },
+             });
+         }
+     }
+@@ -344,10 +364,15 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+     // a line asked for by the contents tab: the first page row it wrapped to
+     // goes at the top, a couple of rows down so it is not flush with the edge
+     if let Some(line) = app.preview_goto.take() {
+-        if let Some(at) = rows
+-            .iter()
+-            .position(|r| r.src_line.is_some_and(|l| l >= line))
+-        {
++        // a block's rows all say the line it started on, so the row to land
++        // on is the one whose own characters came from `line`; only a line
++        // nothing was drawn from — scaffolding, front matter — falls back to
++        // the first row at or after it
++        let drawn_from = |r: &Row| r.cells.iter().any(|c| c.src.is_some_and(|(l, _)| l == line));
++        if let Some(at) = rows.iter().position(drawn_from).or_else(|| {
++            rows.iter()
++                .position(|r| r.src_line.is_some_and(|l| l >= line))
++        }) {
+             app.preview_scroll = at.saturating_sub(2) as u16;
+         }
+     }
+@@ -401,9 +426,11 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+             }
+         }
+         app.preview_page_rows.push((page_row, rect, offset));
+-        lines.push(crate::render::to_line(&selected(
+-            &shown, page_row, offset, span,
+-        )));
++        let mut drawn = selected(&shown, page_row, offset, span);
++        if let Some(label) = &row.label {
++            fold_label_cells(&mut drawn, label, width);
++        }
++        lines.push(crate::render::to_line(&drawn));
+         // every drawn row is recorded, source line or not: a row the renderer
+         // invented — a blank line, a footer row — is still a row a selection
+         // can be dragged across, and one that is missing here silently kills
+@@ -432,6 +459,24 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+     }
+ }
+ 
++/// A folded heading's count at the right edge of its row, the way the editor
++/// puts it, when there is room for it and a gap besides.
++fn fold_label_cells(cells: &mut Vec<PCell>, label: &str, width: usize) {
++    let used = crate::render::cells_width(cells);
++    let need = crate::md::str_width(label) + 2;
++    if used + need > width {
++        return;
++    }
++    let cell = |ch: char, style: Style| PCell {
++        ch,
++        style,
++        link: None,
++        src: None,
++    };
++    cells.extend((0..width - used - need + 2).map(|_| cell(' ', Style::new())));
++    cells.extend(label.chars().map(|ch| cell(ch, dim())));
++}
++
+ /// Overwrite one drawn cell with a continuation mark.
+ fn edge(cells: &mut [PCell], at: usize, ch: char) {
+     if let Some(c) = cells.get_mut(at) {
