@@ -9,6 +9,8 @@ model inside the tool I use, not the bare API.
 It exists to answer one question each time a model ships: which model and effort should be the
 daily driver, and which is worth its time on hard work?
 
+The write-up: [I benchmarked Claude on my own Rust commits to pick a daily driver](https://gauthamv.com/writing/claude-coding-benchmark-own-commits/).
+
 ## Results
 
 Sonnet 5.5, Opus 5.5 and Fable 5.1, run on 2026-09-30 and 2026-10-01 with Claude Code 2.1.286.
@@ -19,6 +21,11 @@ symptom-only prompt of about 150 words and a reference change of 428 to about 3,
 their 40 checks, 22 were met by every one of the 44 runs below; those are **gates**, which a run
 must still meet to pass but which earn no score. The score is the share of the other 18, the
 checks at least one run missed. A run passes when it meets every check.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/checks-vs-time-dark.png">
+  <img src="docs/checks-vs-time.png" width="800" alt="Share of scored checks met against mean minutes per task for the seven configs. Opus high is highest at 89% and 22.5 minutes. Fable low is 81% at 8.4 minutes. Sonnet high is 64% at 6.4 minutes.">
+</picture>
 
 | config | runs | passed | scored checks met | mean score | time, mean | cost, mean | said done but failed |
 |---|---|---|---|---|---|---|---|
